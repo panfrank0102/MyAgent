@@ -18,6 +18,10 @@ public sealed class SessionConfigPatch
     public double? Temperature { get; set; }
     public double? TopP { get; set; }
     public int? MaxTokens { get; set; }
+
+    /// <summary>推理强度（v0.5①）：null = 不设置（显式发送 null → 清除配置，不向上游发送）；
+    /// "low"/"medium"/"high" = 设置。仅支持三档，其余值后端 422。</summary>
+    public string? ReasoningEffort { get; set; }
     public int? MaxContextChars { get; set; }
     public string? ProxyUrl { get; set; }
 }

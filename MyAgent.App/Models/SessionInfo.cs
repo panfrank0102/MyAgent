@@ -40,6 +40,9 @@ public class SessionInfo
     /// <summary>max_tokens，null = 上游默认。</summary>
     public int? MaxTokens { get; set; }
 
+    /// <summary>推理强度（v0.5①）：空串 = 不设置（不向上游发送）；可选 low / medium / high。</summary>
+    public string ReasoningEffort { get; set; } = "";
+
     /// <summary>上下文总预算（字符），默认 80000；0 = 不裁剪（§6.3）。</summary>
     public int MaxContextChars { get; set; } = 80000;
 
@@ -69,6 +72,7 @@ public class SessionInfo
         Temperature = Temperature,
         TopP = TopP,
         MaxTokens = MaxTokens,
+        ReasoningEffort = ReasoningEffort,
         MaxContextChars = MaxContextChars,
         ProxyUrl = ProxyUrl,
         CreatedAt = CreatedAt,
