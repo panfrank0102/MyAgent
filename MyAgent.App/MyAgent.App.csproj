@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- MVVM 框架（源生成器）：ObservableObject / RelayCommand / [ObservableProperty]。
+         正常环境：dotnet restore 后直接编译（版本 8.4.0 与 .NET 8 SDK / C# 12 兼容）。
+         无 NuGet 网络的沙箱环境：以 `dotnet build -p:UseLocalMvvmShim=true` 编译，
+         此时跳过本包引用、改用 verify-shim/ 目录中的最小 API 垫片（仅用于验证/演示，
+         联网后删除该目录即可恢复真实包构建）。 -->
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.0" Condition="'$(UseLocalMvvmShim)' != 'true'" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- verify-shim/ 是离线验证垫片（模拟源生成器产物），仅在 UseLocalMvvmShim=true 时参与编译 -->
+    <Compile Remove="verify-shim/**/*.cs" Condition="'$(UseLocalMvvmShim)' != 'true'" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,6 @@
+# 运行依赖
+fastapi>=0.115
+uvicorn>=0.30
+httpx>=0.28
+
+# 说明：开发/测试依赖见 requirements-dev.txt

@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 运行时数据（数据库、日志），不入版本控制
+data/
+
+# pytest
+.pytest_cache/
+.pytest-basetemp/
+
+# 沙箱测试遗留（受限 ACL 临时目录，待人工清理）
+.test-tmp/
+test-tmp/
+tmp_*/
+pytest-cache-files-*/

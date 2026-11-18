@@ -1,0 +1,10 @@
+# .NET 本地工具与缓存（沙箱环境重定向，避免写入用户目录）
+.dotnet-home/
+.nuget-packages/
+
+# ACL 诊断报告目录
+acl-recovery/
+
+# .NET 构建产物
+MyAgent.App/bin/
+MyAgent.App/obj/
