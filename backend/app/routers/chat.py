@@ -173,6 +173,8 @@ async def _stream_events(
     temperature = session.get("temperature", 1.0)
     top_p = session.get("top_p", 1.0)
     max_tokens = session.get("max_tokens")  # None = 上游默认（§5 sessions 表）
+    # v0.5①：推理强度为 NULL/空 = 不设置，此时不向上游发送该字段（部分模型不支持）。
+    reasoning_effort = (session.get("reasoning_effort") or "") or None
     usage_holder: dict[str, Any] = {"usage": None}
 
     try:
@@ -194,6 +196,7 @@ async def _stream_events(
             base_url, api_key, model, messages,
             temperature, top_p, max_tokens, proxy_url,
             timeout=UPSTREAM_TIMEOUT, usage_out=usage_holder,
+            reasoning_effort=reasoning_effort,
         )
         interrupted = False
         try:

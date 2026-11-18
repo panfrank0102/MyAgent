@@ -9,7 +9,8 @@
 
 覆盖（《开发步骤分解.md》Step 8 完成标准 + 任务要求）：
 meta→delta→done 序列、meta 必发且未命中为空数组、世界书命中 meta、
-error 映射（失败不落库 AI 回复）、regenerate 两分支、regenerate 缺少 user 输入时
+reasoning_effort 透传（v0.5①）、error 映射（失败不落库 AI 回复）、
+regenerate 两分支、regenerate 缺少 user 输入时
 不删除消息（先删后判缺陷回归）、409 并发、
 客户端断开/框架取消 → interrupted=1 落库、test-connection、404/400。
 """
@@ -161,11 +162,12 @@ def make_fake_stream(
 
     async def fake_stream(base_url, api_key, model, messages, temperature, top_p,
                           max_tokens, proxy_url, timeout=120.0, *, transport=None,
-                          usage_out=None):
+                          usage_out=None, reasoning_effort=None):
         if capture is not None:
             capture.update({"base_url": base_url, "api_key": api_key, "model": model,
                             "messages": messages, "temperature": temperature,
-                            "top_p": top_p, "max_tokens": max_tokens, "proxy_url": proxy_url})
+                            "top_p": top_p, "max_tokens": max_tokens, "proxy_url": proxy_url,
+                            "reasoning_effort": reasoning_effort})
         if usage_out is not None and usage is not None:
             usage_out["usage"] = usage
         for c in chunks:
@@ -259,6 +261,39 @@ def test_chat_done_usage_null_when_absent(env, monkeypatch) -> None:
     events = _events(resp)
     assert events[-1]["type"] == "done"
     assert events[-1]["usage"] is None
+
+
+def test_chat_passes_reasoning_effort_to_provider(env, monkeypatch) -> None:
+    """v0.5①：会话 reasoning_effort 非空时透传给 provider.stream_chat。"""
+    db.update_session(env.session["id"], {"reasoning_effort": "high"})
+    capture: dict = {}
+    monkeypatch.setattr(provider_mod, "stream_chat", make_fake_stream(["好"], capture=capture))
+    resp = TestClient(env.app).post(f"/api/sessions/{env.session['id']}/chat",
+                                    json={"content": "你好"})
+    assert _events(resp)[-1]["type"] == "done"
+    assert capture["reasoning_effort"] == "high"
+
+
+def test_chat_reasoning_effort_defaults_to_none(env, monkeypatch) -> None:
+    """v0.5①：未设置（NULL）时向 provider 传 None（不向上游发送该字段）。"""
+    assert db.get_session_raw(env.session["id"])["reasoning_effort"] is None
+    capture: dict = {}
+    monkeypatch.setattr(provider_mod, "stream_chat", make_fake_stream(["好"], capture=capture))
+    resp = TestClient(env.app).post(f"/api/sessions/{env.session['id']}/chat",
+                                    json={"content": "你好"})
+    assert _events(resp)[-1]["type"] == "done"
+    assert capture["reasoning_effort"] is None
+
+
+def test_chat_blank_reasoning_effort_normalized_to_none(env, monkeypatch) -> None:
+    """v0.5①：历史脏数据中的空串也归一为 None（不向上游发送该字段）。"""
+    db.update_session(env.session["id"], {"reasoning_effort": ""})  # 绕开 API 校验模拟脏数据
+    capture: dict = {}
+    monkeypatch.setattr(provider_mod, "stream_chat", make_fake_stream(["好"], capture=capture))
+    resp = TestClient(env.app).post(f"/api/sessions/{env.session['id']}/chat",
+                                    json={"content": "你好"})
+    assert _events(resp)[-1]["type"] == "done"
+    assert capture["reasoning_effort"] is None
 
 
 def test_chat_404_unknown_session(env) -> None:
@@ -525,7 +560,7 @@ def test_concurrent_generation_409(env, monkeypatch) -> None:
 
         async def fake_stream(base_url, api_key, model, messages, temperature, top_p,
                               max_tokens, proxy_url, timeout=120.0, *, transport=None,
-                              usage_out=None):
+                              usage_out=None, reasoning_effort=None):
             entered.set()
             await release.wait()
             yield "慢慢生成"

@@ -92,7 +92,20 @@ class SessionUpdate(BaseModel):
     top_p: float | None = None
     max_tokens: int | None = Field(default=None, ge=-(2**63), le=10_000_000)
     max_context_chars: int | None = Field(default=None, ge=0, le=100_000_000)
+    reasoning_effort: str | None = None
     proxy_url: str | None = None
+
+    @field_validator("reasoning_effort")
+    @classmethod
+    def _validate_reasoning_effort(cls, value: str | None) -> str | None:
+        """推理强度仅接受 low/medium/high 或 null（v0.5①，契约冻结）。
+
+        null = 清除配置（DAO 层置 NULL，之后不向上游发送该字段）；其它值由
+        main.py 全局 422 handler 统一为 {"error":{"code":"validation_error"}}。
+        """
+        if value is not None and value not in ("low", "medium", "high"):
+            raise ValueError("推理强度仅支持 low/medium/high 或 null（不设置）")
+        return value
 
 
 class SessionOut(BaseModel):
@@ -113,6 +126,7 @@ class SessionOut(BaseModel):
     top_p: float
     max_tokens: int | None
     max_context_chars: int
+    reasoning_effort: str | None
     proxy_url: str
     created_at: str
     updated_at: str

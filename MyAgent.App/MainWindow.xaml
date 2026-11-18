@@ -98,10 +98,49 @@
       </Grid>
     </DataTemplate>
 
+    <!-- 消息操作按钮：气泡底部常驻的轻量按钮（无边框/透明底，v0.5②）。
+         Foreground 按角色区分：assistant 深灰（浅灰气泡上可读）、user 近白（蓝底可读）。 -->
+    <Style x:Key="MessageActionButton" TargetType="Button">
+      <Setter Property="FontSize" Value="11"/>
+      <Setter Property="Padding" Value="6,2"/>
+      <Setter Property="Margin" Value="0,0,6,0"/>
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Foreground" Value="#4B5563"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="SnapsToDevicePixels" Value="True"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="Bd" Background="{TemplateBinding Background}" CornerRadius="4"
+                    Padding="{TemplateBinding Padding}">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#22000000"/>
+              </Trigger>
+              <Trigger Property="IsPressed" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#33000000"/>
+              </Trigger>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter Property="Opacity" Value="0.5"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+      <Style.Triggers>
+        <DataTrigger Binding="{Binding IsUser}" Value="True">
+          <Setter Property="Foreground" Value="#EFF6FF"/>
+        </DataTrigger>
+      </Style.Triggers>
+    </Style>
+
     <!-- 消息模板：user 右侧蓝色气泡 / assistant 左侧灰色气泡；
-         悬停操作行（重新生成/重试/删除）；气泡下世界书命中小字；纯文本保留换行 -->
+         操作行常驻气泡底部（v0.5②，不依赖鼠标悬停）；气泡下世界书命中小字；纯文本保留换行 -->
     <DataTemplate DataType="{x:Type vm:MessageItemViewModel}">
-      <Grid x:Name="MessageRow" Margin="0,3">
+      <Grid Margin="0,3">
         <StackPanel MaxWidth="640">
           <StackPanel.Style>
             <Style TargetType="StackPanel">
@@ -113,69 +152,9 @@
             </Style>
           </StackPanel.Style>
 
-          <!-- 悬停操作行：重新生成（最后一条 AI）/ 重试（最后一条 user 且上次失败）/ 删除（级联） -->
-          <StackPanel Orientation="Horizontal" Margin="4,0,4,3">
-            <StackPanel.Style>
-              <Style TargetType="StackPanel">
-                <Style.Triggers>
-                  <DataTrigger Binding="{Binding IsUser}" Value="True">
-                    <Setter Property="HorizontalAlignment" Value="Right"/>
-                  </DataTrigger>
-                </Style.Triggers>
-              </Style>
-            </StackPanel.Style>
-            <Button Content="重新生成" Command="{Binding RegenerateCommand}" FontSize="11" Padding="6,2" Margin="0,0,6,0">
-              <Button.Style>
-                <Style TargetType="Button">
-                  <Setter Property="Visibility" Value="Collapsed"/>
-                  <Style.Triggers>
-                    <MultiDataTrigger>
-                      <MultiDataTrigger.Conditions>
-                        <Condition Binding="{Binding IsMouseOver, ElementName=MessageRow}" Value="True"/>
-                        <Condition Binding="{Binding CanRegenerate}" Value="True"/>
-                      </MultiDataTrigger.Conditions>
-                      <Setter Property="Visibility" Value="Visible"/>
-                    </MultiDataTrigger>
-                  </Style.Triggers>
-                </Style>
-              </Button.Style>
-            </Button>
-            <Button Content="重试" Command="{Binding RetryCommand}" FontSize="11" Padding="6,2" Margin="0,0,6,0">
-              <Button.Style>
-                <Style TargetType="Button">
-                  <Setter Property="Visibility" Value="Collapsed"/>
-                  <Style.Triggers>
-                    <MultiDataTrigger>
-                      <MultiDataTrigger.Conditions>
-                        <Condition Binding="{Binding IsMouseOver, ElementName=MessageRow}" Value="True"/>
-                        <Condition Binding="{Binding CanRetry}" Value="True"/>
-                      </MultiDataTrigger.Conditions>
-                      <Setter Property="Visibility" Value="Visible"/>
-                    </MultiDataTrigger>
-                  </Style.Triggers>
-                </Style>
-              </Button.Style>
-            </Button>
-            <Button Content="删除" Command="{Binding DeleteCommand}" FontSize="11" Padding="6,2">
-              <Button.Style>
-                <Style TargetType="Button">
-                  <Setter Property="Visibility" Value="Collapsed"/>
-                  <Style.Triggers>
-                    <MultiDataTrigger>
-                      <MultiDataTrigger.Conditions>
-                        <Condition Binding="{Binding IsMouseOver, ElementName=MessageRow}" Value="True"/>
-                        <Condition Binding="{Binding CanDelete}" Value="True"/>
-                      </MultiDataTrigger.Conditions>
-                      <Setter Property="Visibility" Value="Visible"/>
-                    </MultiDataTrigger>
-                  </Style.Triggers>
-                </Style>
-              </Button.Style>
-            </Button>
-          </StackPanel>
-
           <!-- 气泡：纯文本 + 保留换行；AI 流式增长由 Content 属性变更驱动；
-               interrupted 消息的“（已停止）”已拼入 DisplayText -->
+               interrupted 消息的“（已停止）”已拼入 DisplayText；
+               v0.5②：操作行常驻气泡底部，可见性只由 CanXxx 决定（不再依赖鼠标悬停） -->
           <Border CornerRadius="10" Padding="10,8" MaxWidth="560">
             <Border.Style>
               <Style TargetType="Border">
@@ -187,18 +166,46 @@
                 </Style.Triggers>
               </Style>
             </Border.Style>
-            <TextBlock Text="{Binding DisplayText}" TextWrapping="Wrap" FontSize="14" LineHeight="21">
-              <TextBlock.Style>
-                <Style TargetType="TextBlock">
-                  <Setter Property="Foreground" Value="#1F2937"/>
-                  <Style.Triggers>
-                    <DataTrigger Binding="{Binding IsUser}" Value="True">
-                      <Setter Property="Foreground" Value="White"/>
-                    </DataTrigger>
-                  </Style.Triggers>
-                </Style>
-              </TextBlock.Style>
-            </TextBlock>
+            <StackPanel>
+              <TextBlock Text="{Binding DisplayText}" TextWrapping="Wrap" FontSize="14" LineHeight="21">
+                <TextBlock.Style>
+                  <Style TargetType="TextBlock">
+                    <Setter Property="Foreground" Value="#1F2937"/>
+                    <Style.Triggers>
+                      <DataTrigger Binding="{Binding IsUser}" Value="True">
+                        <Setter Property="Foreground" Value="White"/>
+                      </DataTrigger>
+                    </Style.Triggers>
+                  </Style>
+                </TextBlock.Style>
+              </TextBlock>
+
+              <!-- 操作行：常驻气泡底部；HasActions=false 时整行隐藏，不在气泡底部留空白 -->
+              <StackPanel Orientation="Horizontal" Margin="0,8,0,0"
+                          Visibility="{Binding HasActions, Converter={StaticResource BoolToVis}}">
+                <StackPanel.Style>
+                  <Style TargetType="StackPanel">
+                    <Style.Triggers>
+                      <DataTrigger Binding="{Binding IsUser}" Value="True">
+                        <Setter Property="HorizontalAlignment" Value="Right"/>
+                      </DataTrigger>
+                    </Style.Triggers>
+                  </Style>
+                </StackPanel.Style>
+                <Button Content="重新生成" Command="{Binding RegenerateCommand}"
+                        Style="{StaticResource MessageActionButton}"
+                        Visibility="{Binding CanRegenerate, Converter={StaticResource BoolToVis}}"
+                        ToolTip="删除当前回复后按现有历史重新生成（仅最后一条 AI 回复可用）"/>
+                <Button Content="重试" Command="{Binding RetryCommand}"
+                        Style="{StaticResource MessageActionButton}"
+                        Visibility="{Binding CanRetry, Converter={StaticResource BoolToVis}}"
+                        ToolTip="上次生成失败：以该用户消息重新生成"/>
+                <Button Content="删除" Command="{Binding DeleteCommand}"
+                        Style="{StaticResource MessageActionButton}" Margin="0"
+                        Visibility="{Binding CanDelete, Converter={StaticResource BoolToVis}}"
+                        ToolTip="删除此消息及其后所有消息（需确认）"/>
+              </StackPanel>
+            </StackPanel>
           </Border>
 
           <!-- 世界书命中小字：无命中（HitText=null）时整行隐藏（§8） -->

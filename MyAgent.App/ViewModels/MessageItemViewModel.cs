@@ -44,6 +44,12 @@ public partial class MessageItemViewModel : ObservableObject
     [ObservableProperty]
     private bool _canRetry;
 
+    /// <summary>
+    /// 气泡底部操作行是否显示（v0.5②：按钮常驻、不再依赖鼠标悬停）。
+    /// 纯展示派生属性：任一消息级操作可用时显示；否则整行隐藏，避免气泡底部留空。
+    /// </summary>
+    public bool HasActions => CanDelete || CanRegenerate || CanRetry;
+
     /// <summary>本轮命中的世界书条目（来自 meta 事件）。</summary>
     [ObservableProperty]
     private IReadOnlyList<MatchedEntry> _matchedEntries = Array.Empty<MatchedEntry>();
@@ -81,9 +87,23 @@ public partial class MessageItemViewModel : ObservableObject
     partial void OnContentChanged(string value) => OnPropertyChanged(nameof(DisplayText));
     partial void OnInterruptedChanged(bool value) => OnPropertyChanged(nameof(DisplayText));
     partial void OnMatchedEntriesChanged(IReadOnlyList<MatchedEntry> value) => HitText = BuildHitText(value);
-    partial void OnCanDeleteChanged(bool value) => DeleteCommand.NotifyCanExecuteChanged();
-    partial void OnCanRegenerateChanged(bool value) => RegenerateCommand.NotifyCanExecuteChanged();
-    partial void OnCanRetryChanged(bool value) => RetryCommand.NotifyCanExecuteChanged();
+    partial void OnCanDeleteChanged(bool value)
+    {
+        DeleteCommand.NotifyCanExecuteChanged();
+        OnPropertyChanged(nameof(HasActions));
+    }
+
+    partial void OnCanRegenerateChanged(bool value)
+    {
+        RegenerateCommand.NotifyCanExecuteChanged();
+        OnPropertyChanged(nameof(HasActions));
+    }
+
+    partial void OnCanRetryChanged(bool value)
+    {
+        RetryCommand.NotifyCanExecuteChanged();
+        OnPropertyChanged(nameof(HasActions));
+    }
 
     // ---- 流式节流缓冲 ----
 

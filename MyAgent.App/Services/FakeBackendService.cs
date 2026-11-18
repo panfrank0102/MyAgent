@@ -168,6 +168,8 @@ public sealed class FakeBackendService : IBackendService
             if (patch.BaseUrl != null) session.BaseUrl = patch.BaseUrl;
             if (patch.Model != null) session.Model = patch.Model;
             session.MaxTokens = patch.MaxTokens; // null = 清除（上游默认）
+            // v0.5①：推理强度整表保存；null = 清除（Fake 用空串表示“不设置/不向上游发送”），值原样存
+            session.ReasoningEffort = patch.ReasoningEffort ?? "";
             if (patch.Temperature.HasValue) session.Temperature = patch.Temperature.Value;
             if (patch.TopP.HasValue) session.TopP = patch.TopP.Value;
             if (patch.MaxContextChars.HasValue) session.MaxContextChars = Math.Max(0, patch.MaxContextChars.Value);

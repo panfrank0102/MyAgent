@@ -165,6 +165,55 @@ def test_patch_api_key_masked_and_empty_not_update(client: TestClient) -> None:
     assert "sk-secret-key-12345678" not in str(listed)
 
 
+def test_patch_reasoning_effort_set_clear_and_echo(client: TestClient) -> None:
+    """v0.5①：PATCH reasoning_effort 设置 low/medium/high → 回显；null 清除。"""
+    session = _create_session(client)
+    # 新会话默认 null，且列表/详情 JSON 均含该字段（契约冻结字段名）
+    assert session["reasoning_effort"] is None
+    assert "reasoning_effort" in client.get(f"/api/sessions/{session['id']}").json()
+    listed = client.get("/api/sessions").json()
+    assert "reasoning_effort" in listed[0]
+    assert listed[0]["reasoning_effort"] is None
+
+    for value in ("low", "medium", "high"):
+        resp = client.patch(
+            f"/api/sessions/{session['id']}", json={"reasoning_effort": value}
+        )
+        assert resp.status_code == 200, value
+        assert resp.json()["reasoning_effort"] == value  # PATCH 响应回显
+        assert db.get_session_raw(session["id"])["reasoning_effort"] == value  # 已落库
+        assert (
+            client.get(f"/api/sessions/{session['id']}").json()["reasoning_effort"] == value
+        )  # GET 详情回显
+        assert client.get("/api/sessions").json()[0]["reasoning_effort"] == value
+
+    # 显式 null = 清除配置（置 NULL，之后不向上游发送该字段）
+    resp = client.patch(f"/api/sessions/{session['id']}", json={"reasoning_effort": None})
+    assert resp.status_code == 200
+    assert resp.json()["reasoning_effort"] is None
+    assert db.get_session_raw(session["id"])["reasoning_effort"] is None
+    assert client.get(f"/api/sessions/{session['id']}").json()["reasoning_effort"] is None
+
+
+def test_patch_reasoning_effort_invalid_422(client: TestClient) -> None:
+    """v0.5①：reasoning_effort 仅接受 low/medium/high 或 null，否则 422 且不落库。"""
+    session = _create_session(client)
+    client.patch(f"/api/sessions/{session['id']}", json={"reasoning_effort": "high"})
+
+    for bad in ("extreme", "HIGH", "low ", "", "medium\n", 123):
+        resp = client.patch(
+            f"/api/sessions/{session['id']}", json={"reasoning_effort": bad}
+        )
+        assert resp.status_code == 422, bad
+        body = resp.json()
+        assert set(body.keys()) == {"error"}
+        # 走 main.py 全局 422 handler 的统一 code（不新造 code）
+        assert body["error"]["code"] == "validation_error"
+        assert isinstance(body["error"]["message"], str) and body["error"]["message"]
+        # 校验失败不落库：原值保持不变
+        assert db.get_session_raw(session["id"])["reasoning_effort"] == "high"
+
+
 def test_not_found_error_shape(client: TestClient) -> None:
     """会话不存在 → 404，错误体为统一的 {"error":{"code","message"}}。"""
     cases = [

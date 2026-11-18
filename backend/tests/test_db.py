@@ -83,7 +83,16 @@ def test_init_db_idempotent_and_schema_version(dbfile: Path) -> None:
 
 
 def test_init_db_incremental_migration(dbfile: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """MIGRATIONS 追加新版本：只执行未应用版本，schema_version 递增且可重入。"""
+    """MIGRATIONS 追加新版本：只执行未应用版本，schema_version 递增且可重入。
+
+    当前真实 MIGRATIONS 已含 v2（v0.5① reasoning_effort），因此本测试使用独立
+    临时库并先只应用 v1，再追加一个演示 v2——验证迁移框架的增量行为，与真实
+    迁移内容解耦（否则 dbfile 已由真实 v2 建好，演示迁移会被当作"已执行"跳过）。
+    """
+    path = dbfile.parent / "incremental.db"
+    monkeypatch.setattr(db, "MIGRATIONS", [(1, db.SCHEMA_V1)])
+    db.init_db(path)  # 先只建 v1 库
+
     monkeypatch.setattr(
         db,
         "MIGRATIONS",
@@ -92,9 +101,9 @@ def test_init_db_incremental_migration(dbfile: Path, monkeypatch: pytest.MonkeyP
             (2, "CREATE TABLE demo_incremental (id INTEGER PRIMARY KEY);"),
         ],
     )
-    db.init_db(dbfile)  # 当前已是 v1，只应执行 v2
-    db.init_db(dbfile)  # 再次调用幂等
-    conn = sqlite3.connect(str(dbfile))
+    db.init_db(path)  # 当前已是 v1，只应执行 v2
+    db.init_db(path)  # 再次调用幂等
+    conn = sqlite3.connect(str(path))
     try:
         version = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         tables = {
@@ -110,7 +119,15 @@ def test_init_db_incremental_migration(dbfile: Path, monkeypatch: pytest.MonkeyP
 def test_init_db_failed_migration_rolls_back(
     dbfile: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """迁移脚本中途失败：DDL 与 schema_version 同一事务回滚，修正后可继续升级。"""
+    """迁移脚本中途失败：DDL 与 schema_version 同一事务回滚，修正后可继续升级。
+
+    同 test_init_db_incremental_migration：使用独立库先只应用 v1，
+    再以损坏的演示 v2 验证回滚（真实 MIGRATIONS 已到 v2，不能再在其上叠加）。
+    """
+    path = dbfile.parent / "rollback.db"
+    monkeypatch.setattr(db, "MIGRATIONS", [(1, db.SCHEMA_V1)])
+    db.init_db(path)  # 先只建 v1 库
+
     monkeypatch.setattr(
         db,
         "MIGRATIONS",
@@ -120,9 +137,9 @@ def test_init_db_failed_migration_rolls_back(
         ],
     )
     with pytest.raises(sqlite3.OperationalError):
-        db.init_db(dbfile)
+        db.init_db(path)
 
-    conn = sqlite3.connect(str(dbfile))
+    conn = sqlite3.connect(str(path))
     try:
         version = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         tables = {
@@ -143,8 +160,8 @@ def test_init_db_failed_migration_rolls_back(
             (2, "CREATE TABLE half_migrated (id INTEGER PRIMARY KEY);"),
         ],
     )
-    db.init_db(dbfile)
-    conn = sqlite3.connect(str(dbfile))
+    db.init_db(path)
+    conn = sqlite3.connect(str(path))
     try:
         version = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         tables = {
@@ -154,6 +171,101 @@ def test_init_db_failed_migration_rolls_back(
         conn.close()
     assert version == "2"
     assert "half_migrated" in tables
+
+
+def test_init_db_schema_v2_and_reasoning_effort_column(dbfile: Path) -> None:
+    """v2 迁移：schema_version==2，sessions 表含 reasoning_effort TEXT（可 NULL）。
+
+    历史 v1 库的升级路径见 test_init_db_upgrades_v1_database_to_v2。
+    """
+    assert db.MIGRATIONS[-1][0] == 2
+    conn = sqlite3.connect(str(dbfile))
+    try:
+        version = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+        columns = {row[1]: row for row in conn.execute("PRAGMA table_info(sessions)")}
+    finally:
+        conn.close()
+    assert version == "2"
+    assert "reasoning_effort" in columns
+    # PRAGMA table_info 列：cid, name, type, notnull, dflt_value, pk
+    assert columns["reasoning_effort"][2] == "TEXT"
+    assert columns["reasoning_effort"][3] == 0   # 可 NULL（notnull=0）
+    assert columns["reasoning_effort"][4] is None  # 无默认值
+
+
+def test_init_db_upgrades_v1_database_to_v2(tmp_path: Path) -> None:
+    """旧版 v1 库（含既有数据）启动时自动增量升级到 v2，数据保留且新列为 NULL。"""
+
+    def _make_v1_db(path: Path) -> None:
+        conn = sqlite3.connect(str(path))
+        try:
+            conn.executescript(db.SCHEMA_V1)  # v1 建表（不含 reasoning_effort）
+            conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', '1')")
+            conn.execute(
+                "INSERT INTO sessions ("
+                " id, name, system_prompt, scan_rounds, worldbook_enabled, base_url,"
+                " api_key, model, temperature, top_p, max_tokens, max_context_chars,"
+                " proxy_url, created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("old-session", "旧会话", "旧提示词", 2, 0, "http://old", "sk-old",
+                 "old-model", 0.5, 0.8, 100, 5000, "", "2026-01-01T00:00:00.000000Z",
+                 "2026-01-02T00:00:00.000000Z"),
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, interrupted, created_at)"
+                " VALUES ('old-session', 'user', '旧消息', 0, '2026-01-01T00:00:00.000000Z')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    # 1) 构造 v1 库（含数据）
+    path = tmp_path / "legacy-v1.db"
+    _make_v1_db(path)
+    conn = sqlite3.connect(str(path))
+    try:
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()[0] == "1"
+        assert "reasoning_effort" not in {
+            row[1] for row in conn.execute("PRAGMA table_info(sessions)")
+        }
+    finally:
+        conn.close()
+
+    # 2) 启动 init_db → 自动增量升级到 v2
+    db.init_db(path)
+    conn = sqlite3.connect(str(path))
+    try:
+        version = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+        row = conn.execute(
+            "SELECT name, reasoning_effort FROM sessions WHERE id='old-session'"
+        ).fetchone()
+        msg_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    finally:
+        conn.close()
+    assert version == "2"
+    assert "reasoning_effort" in columns
+    assert row == ("旧会话", None)  # 既有数据保留；新列默认 NULL
+    assert msg_count == 1
+
+    # 3) 幂等：再次 init 不报错、版本不变
+    db.init_db(path)
+    conn = sqlite3.connect(str(path))
+    try:
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()[0] == "2"
+    finally:
+        conn.close()
+
+    # 4) 升级后可正常通过 DAO 读写新列
+    session = db.get_session_raw("old-session")
+    assert session is not None and session["reasoning_effort"] is None
+    updated = db.update_session("old-session", {"reasoning_effort": "medium"})
+    assert updated is not None and updated["reasoning_effort"] == "medium"
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +303,8 @@ def test_create_session_defaults(dbfile: Path) -> None:
     assert session["base_url"] is None
     assert session["model"] is None
     assert session["max_tokens"] is None
+    # v0.5①：推理强度默认 NULL（不设置/不向上游发送）
+    assert session["reasoning_effort"] is None
     # id 为 UUID 形态（TEXT PK，§5）
     assert len(session["id"]) == 36 and session["id"].count("-") == 4
     # 时间字段为 UTC ISO8601
@@ -279,6 +393,26 @@ def test_update_session_nullable_fields(dbfile: Path) -> None:
     assert cleared["proxy_url"] == ""
     # worldbook_enabled 存 0/1 整型
     assert db.update_session(session["id"], {"worldbook_enabled": False})["worldbook_enabled"] == 0
+
+
+def test_update_session_reasoning_effort_set_and_clear(dbfile: Path) -> None:
+    """v0.5①：reasoning_effort 可设置 low/medium/high；显式 null = 清除回 NULL。"""
+    session = db.create_session("s")
+    assert session["reasoning_effort"] is None  # 新会话默认 NULL
+
+    for value in ("low", "medium", "high"):
+        updated = db.update_session(session["id"], {"reasoning_effort": value})
+        assert updated is not None
+        assert updated["reasoning_effort"] == value
+        assert db.get_session_raw(session["id"])["reasoning_effort"] == value
+        # 列表路径同样回显该列
+        assert db.list_sessions()[0]["reasoning_effort"] == value
+
+    cleared = db.update_session(session["id"], {"reasoning_effort": None})
+    assert cleared is not None
+    assert cleared["reasoning_effort"] is None  # null = 清除配置（置 NULL）
+    assert db.get_session_raw(session["id"])["reasoning_effort"] is None
+    assert cleared["name"] == "s"  # 清除不影响其它字段
 
 
 def test_update_session_null_bool_not_updated(dbfile: Path) -> None:

@@ -87,6 +87,10 @@ CREATE INDEX idx_worldbook_session_sort ON worldbook_entries(session_id, sort_or
 # MIGRATIONS：(版本号, SQL 脚本)；新版本只追加到列表末尾，禁止修改历史条目。
 MIGRATIONS: list[tuple[int, str]] = [
     (1, SCHEMA_V1),
+    # v2（v0.5①）：会话新增推理强度 reasoning_effort（可 NULL，无默认值）。
+    # NULL = 不设置/不向上游发送该字段；取值 low/medium/high 由 API 层校验。
+    # 历史 v1 库启动时由 init_db 自动增量升级，既有数据 reasoning_effort 为 NULL。
+    (2, "ALTER TABLE sessions ADD COLUMN reasoning_effort TEXT;"),
 ]
 
 # 会话表可被 update_session 更新的列（§4.3 PATCH 契约 + §5 表结构）。
@@ -102,13 +106,15 @@ _SESSION_COLUMNS = {
     "top_p",
     "max_tokens",
     "max_context_chars",
+    "reasoning_effort",
     "proxy_url",
 }
 
 # 允许显式置为 NULL（"清除配置"）的列；其余列传入 None 视为"未提供"跳过。
 # 注意：proxy_url 为 NOT NULL DEFAULT ''（§5 "可空 = 直连" 指空串，非 NULL），
 # 清除代理应 PATCH 空串，因此不在此列表。
-_SESSION_NULLABLE = {"base_url", "model", "max_tokens"}
+# reasoning_effort（v0.5①）为可空 TEXT：null = 清除配置（置 NULL，不向上游发送）。
+_SESSION_NULLABLE = {"base_url", "model", "max_tokens", "reasoning_effort"}
 
 # 世界书条目表可被 update_worldbook_entry 更新的列（§4.3 PATCH 契约）。
 _WORLDBOOK_COLUMNS = {"name", "keywords", "content", "enabled", "sort_order"}
@@ -290,7 +296,8 @@ def create_session(name: str) -> dict:
     默认值（严格照抄 §5.1 / §4.3）：
         temperature 1.0、top_p 1.0、scan_rounds 4、worldbook_enabled 1、
         max_context_chars 80000、proxy_url 空、system_prompt 空；
-        base_url / model / max_tokens 为 NULL（可空，上游默认）。
+        base_url / model / max_tokens / reasoning_effort 为 NULL（可空，
+        上游默认；reasoning_effort 为 NULL = 不设置/不发送，v0.5①）。
     """
     session_id = _new_uuid()
     now = _utcnow()

@@ -4,7 +4,7 @@
 - 流式增量文本与 usage 捕获、请求体/请求头断言；
 - 错误分类：401/403→auth_failed、429→rate_limited、超时→timeout、
   连接/代理失败→upstream_unreachable、其余→internal；
-- max_tokens=None 不传该字段；代理参数不炸。
+- max_tokens=None 不传该字段；reasoning_effort 为 None/空串时不传（v0.5①）；代理参数不炸。
 
 说明：环境未安装 pytest-asyncio，async 用例统一用 asyncio.run 在同步
 测试函数内驱动（不新增依赖、不修改共享环境）。
@@ -26,6 +26,7 @@ from app.services.provider import (
     CODE_TIMEOUT,
     CODE_UPSTREAM_UNREACHABLE,
     ProviderError,
+    _build_body,
     stream_chat,
     # 别名避免 pytest 把导入的函数名 test_connection 误收集为测试用例
     test_connection as provider_test_connection,
@@ -95,6 +96,48 @@ def test_stream_max_tokens_included() -> None:
     collect(stream_chat(BASE, "", "m", MESSAGES, 1.0, 1.0, 512, None,
                         transport=httpx.MockTransport(handler)))
     assert captured["body"]["max_tokens"] == 512
+
+
+def test_build_body_reasoning_effort() -> None:
+    """v0.5①：_build_body 仅在 reasoning_effort 非空时加入请求体。"""
+    body = _build_body("m", MESSAGES, 1.0, 1.0, None, "high")
+    assert body["reasoning_effort"] == "high"
+    # None / 空串 = 不设置 → 不发送该字段（部分模型不支持，发送会报错）
+    assert "reasoning_effort" not in _build_body("m", MESSAGES, 1.0, 1.0, None)
+    assert "reasoning_effort" not in _build_body("m", MESSAGES, 1.0, 1.0, None, None)
+    assert "reasoning_effort" not in _build_body("m", MESSAGES, 1.0, 1.0, None, "")
+
+
+def test_stream_reasoning_effort_included() -> None:
+    """v0.5①：stream_chat 设置 reasoning_effort 时请求体包含该字段。"""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return _sse_response({"choices": [{"delta": {"content": "x"}}]})
+
+    texts = collect(stream_chat(
+        BASE, "", "m", MESSAGES, 1.0, 1.0, None, None,
+        transport=httpx.MockTransport(handler), reasoning_effort="high",
+    ))
+    assert texts == ["x"]
+    assert captured["body"]["reasoning_effort"] == "high"
+
+
+def test_stream_reasoning_effort_absent_when_none_or_blank() -> None:
+    """v0.5①：None / 空串时请求体不含 reasoning_effort 字段。"""
+    for value in (None, ""):
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return _sse_response({"choices": [{"delta": {"content": "x"}}]})
+
+        collect(stream_chat(
+            BASE, "", "m", MESSAGES, 1.0, 1.0, None, None,
+            transport=httpx.MockTransport(handler), reasoning_effort=value,
+        ))
+        assert "reasoning_effort" not in captured["body"], value
 
 
 def test_stream_tolerates_junk_lines() -> None:

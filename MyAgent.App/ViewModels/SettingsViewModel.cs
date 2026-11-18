@@ -10,7 +10,7 @@ namespace MyAgent.App.ViewModels;
 /// 会话设置窗口视图模型（Step 12 / §8）：
 ///  - 打开时 GET /api/sessions/{id} 拉取最新配置回显（失败显示错误条，不弹裸异常）；
 ///  - 保存 = 整表提交 <see cref="SessionConfigPatch"/>（空字符串字段发 ""、max_tokens 空 → null 清除、
-///    api_key 未改动/为空 → 不发送），再回显服务端返回的快照；
+///    reasoning_effort 选“不设置” → null 清除（v0.5①）、api_key 未改动/为空 → 不发送），再回显服务端返回的快照；
 ///  - 测试连接 = 收集表单当前值调用 TestConnectionAsync，结果以 Ok/Message 展示（服务层约定不抛异常）；
 ///  - 数值与代理地址做本地校验：非法时禁用“保存”并给出提示，避免产生未处理异常。
 /// 注意：本类刻意不使用 [ObservableProperty] 源生成器特性——新增 VM 用 ObservableObject.SetProperty
@@ -46,6 +46,7 @@ public partial class SettingsViewModel : ObservableObject
     private string _temperatureText = "1";
     private string _topPText = "1";
     private string _maxTokensText = "";
+    private string _reasoningEffortSelected = "";
     private string _maxContextCharsText = "80000";
     private string _proxyUrl = "";
 
@@ -167,6 +168,20 @@ public partial class SettingsViewModel : ObservableObject
         set
         {
             if (!SetProperty(ref _maxTokensText, value)) return;
+            Validate();
+        }
+    }
+
+    /// <summary>
+    /// 推理强度（v0.5①）："" = 不设置（不向上游发送该参数）/ "low" / "medium" / "high"。
+    /// 由 ComboBox（SelectedValue + Tag）双向绑定；契约只接受上述三档，故不做数值校验。
+    /// </summary>
+    public string ReasoningEffortSelected
+    {
+        get => _reasoningEffortSelected;
+        set
+        {
+            if (!SetProperty(ref _reasoningEffortSelected, value ?? "")) return;
             Validate();
         }
     }
@@ -306,6 +321,7 @@ public partial class SettingsViewModel : ObservableObject
     /// <summary>
     /// 整表保存：构建 <see cref="SessionConfigPatch"/> 并 PATCH；成功回显服务端快照。
     /// 语义（契约冻结）：空字符串字段发 ""；max_tokens 空 → null（清除，上游默认）；
+    /// reasoning_effort 选“不设置” → null（清除，v0.5①）；
     /// max_context_chars 空 → null（未提供，不更新）；api_key 未改动/为空 → 不发送。
     /// </summary>
     public async Task SaveAsync(CancellationToken ct = default)
@@ -424,6 +440,8 @@ public partial class SettingsViewModel : ObservableObject
         TemperatureText = FormatNumber(info.Temperature);
         TopPText = FormatNumber(info.TopP);
         MaxTokensText = info.MaxTokens?.ToString(CultureInfo.InvariantCulture) ?? "";
+        // v0.5①：后端 NULL → 空串（“不设置”），其他值原样回显
+        ReasoningEffortSelected = string.IsNullOrEmpty(info.ReasoningEffort) ? "" : info.ReasoningEffort;
         MaxContextCharsText = info.MaxContextChars.ToString(CultureInfo.InvariantCulture);
         ProxyUrl = info.ProxyUrl;
         SetMaskedApiKey(info.MaskedApiKey);
@@ -457,6 +475,8 @@ public partial class SettingsViewModel : ObservableObject
             MaxTokens = _maxTokensText.Trim().Length == 0
                 ? null
                 : (TryParseInt(_maxTokensText, out int maxTokens) ? maxTokens : null),
+            // v0.5①：空选择 = 不设置（null = 清除配置，不向上游发送该参数）；其余原样提交
+            ReasoningEffort = string.IsNullOrEmpty(_reasoningEffortSelected) ? null : _reasoningEffortSelected,
             // 空文本框 = 未提供、不更新（其余字段的 null 语义，§4.3）
             MaxContextChars = _maxContextCharsText.Trim().Length == 0
                 ? null

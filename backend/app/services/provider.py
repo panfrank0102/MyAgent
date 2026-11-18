@@ -4,8 +4,9 @@
 
 设计要点：
 - stream_chat 为 async 生成器，逐段 yield 增量文本（choices[0].delta.content）；
-- 请求体 {"model","messages","stream":true,"temperature","top_p","max_tokens"}，
-  max_tokens 为 None 时不传（§6.1 第 7 点）；
+- 请求体 {"model","messages","stream":true,"temperature","top_p","max_tokens",
+  "reasoning_effort"}，max_tokens / reasoning_effort 为 None（或空串）时不传
+  （§6.1 第 7 点 / v0.5①）；
 - headers 含 Authorization: Bearer <key>；
 - 支持每会话 HTTP 代理（proxy_url，空 = 直连，§2 第 20 行）；
 - 默认超时 120s（§6.1 第 10 点）；
@@ -105,8 +106,13 @@ def _build_body(
     temperature: Optional[float],
     top_p: Optional[float],
     max_tokens: Optional[int],
+    reasoning_effort: Optional[str] = None,
 ) -> dict[str, Any]:
-    """构造请求体（§6.1 第 7 点）；max_tokens 为 None 时不传该字段。"""
+    """构造请求体（§6.1 第 7 点）；max_tokens / reasoning_effort 为空时不传。
+
+    reasoning_effort（v0.5①）：仅当非空时加入请求体；部分模型不支持该参数，
+    NULL/空串时发送会报错，因此不发送该字段。
+    """
     body: dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -118,6 +124,8 @@ def _build_body(
         body["top_p"] = top_p
     if max_tokens is not None:
         body["max_tokens"] = max_tokens
+    if reasoning_effort:
+        body["reasoning_effort"] = reasoning_effort
     return body
 
 
@@ -215,18 +223,21 @@ async def stream_chat(
     *,
     transport: Optional[httpx.AsyncBaseTransport] = None,
     usage_out: Optional[dict[str, Any]] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
     """调用上游 {base_url}/chat/completions（stream=true），逐段 yield 增量文本。
 
     - transport：仅供测试注入 httpx.MockTransport（生产不传）；
     - usage_out：可选 dict，生成过程中最后一个含 usage 的 chunk 会写入 usage_out["usage"]，
       chat 路由据此填充 done 事件的 usage（契约允许 usage 为空，因此该参数可选）；
+    - reasoning_effort：可选推理强度（v0.5①，low/medium/high）；None/空串时不向上游
+      发送该字段（部分模型不支持该参数）；
     - 消费者 aclose() 本生成器（前端停止/客户端断开）时，async with 会关闭响应与
       client，从而中止对上游的请求（§4.2 停止语义）；
     - 所有异常统一转为 ProviderError 抛出（§6.1 第 10 点）。
     """
     url = _endpoint(base_url)
-    body = _build_body(model, messages, temperature, top_p, max_tokens)
+    body = _build_body(model, messages, temperature, top_p, max_tokens, reasoning_effort)
     with _translate_errors("上游调用"):
         # timeout 统一用于连接/读写/池化（契约仅给出总超时 120s，未细分）。
         async with _client(timeout, proxy_url, transport) as client:

@@ -102,6 +102,18 @@
         <TextBox Text="{Binding Model, UpdateSourceTrigger=PropertyChanged}" Style="{StaticResource FieldBox}"/>
         <TextBlock Text="例如 gpt-4o-mini；留空 = 清除配置。" Style="{StaticResource HintText}"/>
 
+        <!-- 推理强度（v0.5①）：空值 = 不设置 → 不向上游发送 reasoning_effort 参数 -->
+        <TextBlock Text="推理强度" Style="{StaticResource FieldLabel}" Margin="0,12,0,3"/>
+        <ComboBox x:Name="ReasoningEffortBox" Width="160" HorizontalAlignment="Left"
+                  FontSize="13" Padding="6,4" SelectedValuePath="Tag"
+                  SelectedValue="{Binding ReasoningEffortSelected, Mode=TwoWay}">
+          <ComboBoxItem Content="不设置" Tag=""/>
+          <ComboBoxItem Content="低" Tag="low"/>
+          <ComboBoxItem Content="中" Tag="medium"/>
+          <ComboBoxItem Content="高" Tag="high"/>
+        </ComboBox>
+        <TextBlock Text="部分模型不支持该参数：不设置即不向上游发送。" Style="{StaticResource HintText}"/>
+
         <!-- 采样参数 -->
         <Grid Margin="0,12,0,0">
           <Grid.ColumnDefinitions>

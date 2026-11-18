@@ -17,7 +17,7 @@ namespace MyAgent.App.Services;
 /// <item>REST 非 2xx → <see cref="BackendApiException"/>（Code/中文 Message 透传）；
 /// 语义上“资源不存在”的方法按 FakeBackendService 约定返回 null/false/0，而不是抛异常；</item>
 /// <item>“设置页整表保存”语义：除 api_key 为 null/空串不发送外，所有字段显式发送（含 null），
-/// 与 v0.4① 的 base_url/model/max_tokens 的 null=清除 对齐；</item>
+/// 与 v0.4① 的 base_url/model/max_tokens 的 null=清除 对齐（v0.5① 的 reasoning_effort 同理）；</item>
 /// <item>流式 chat/regenerate：取消令牌直接透传给 ApiClient（界面“停止生成”= 断开请求）；</item>
 /// <item>test-connection 约定不抛异常：成功/失败/后端不可达都返回 <see cref="TestConnectionResult"/>。</item>
 /// </list>
@@ -170,7 +170,7 @@ public sealed class RealApiBackendService : IBackendService
     /// <summary>
     /// PATCH /api/sessions/{id}：整表保存会话配置（v0.4 语义）。
     /// api_key 为 null/空串时不发送；其余字段全部显式发送（null 也发）——
-    /// base_url/model/max_tokens 的 null = 清除配置，其余 null 后端按“未提供”忽略。
+    /// base_url/model/max_tokens/reasoning_effort 的 null = 清除配置（v0.5①），其余 null 后端按“未提供”忽略。
     /// 会话不存在返回 null；数值越界（422）等校验失败抛 <see cref="BackendApiException"/>。
     /// </summary>
     public async Task<SessionInfo?> UpdateSessionConfigAsync(
@@ -189,6 +189,8 @@ public sealed class RealApiBackendService : IBackendService
             Temperature = patch.Temperature,
             TopP = patch.TopP,
             MaxTokens = patch.MaxTokens,
+            // v0.5①：null 必须显式序列化（= 清除配置，不向上游发送），因此该属性不加 JsonIgnore
+            ReasoningEffort = patch.ReasoningEffort,
             MaxContextChars = patch.MaxContextChars,
             ProxyUrl = patch.ProxyUrl,
         };
@@ -384,6 +386,8 @@ public sealed class RealApiBackendService : IBackendService
         Temperature = dto.Temperature,
         TopP = dto.TopP,
         MaxTokens = dto.MaxTokens,
+        // v0.5①：后端 NULL = 不设置，C# 模型用空串表达“不设置/不向上游发送”
+        ReasoningEffort = dto.ReasoningEffort ?? "",
         MaxContextChars = dto.MaxContextChars,
         ProxyUrl = dto.ProxyUrl ?? "",
         CreatedAt = ParseTimestamp(dto.CreatedAt),
@@ -440,6 +444,7 @@ public sealed class RealApiBackendService : IBackendService
         public double Temperature { get; set; }
         public double TopP { get; set; }
         public int? MaxTokens { get; set; }
+        public string? ReasoningEffort { get; set; }
         public int MaxContextChars { get; set; }
         public string? ProxyUrl { get; set; }
         public string? CreatedAt { get; set; }
@@ -464,6 +469,13 @@ public sealed class RealApiBackendService : IBackendService
         public double? Temperature { get; set; }
         public double? TopP { get; set; }
         public int? MaxTokens { get; set; }
+
+        /// <summary>
+        /// 推理强度（v0.5①）：null 必须显式发送（= 清除配置，不向上游发送），
+        /// 与 base_url/model/max_tokens 同理，故这里<b>不能</b>加 JsonIgnore。
+        /// </summary>
+        public string? ReasoningEffort { get; set; }
+
         public int? MaxContextChars { get; set; }
         public string? ProxyUrl { get; set; }
     }
