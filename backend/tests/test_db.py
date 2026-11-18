@@ -68,7 +68,7 @@ def test_init_db_idempotent_and_schema_version(dbfile: Path) -> None:
         tables = {
             row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
-        assert {"sessions", "messages", "worldbook_entries", "meta"} <= tables
+        assert {"sessions", "messages", "worldbook_entries", "model_presets", "meta"} <= tables
         row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
         assert row is not None
         assert row[0] == str(db.MIGRATIONS[-1][0])  # 已执行到最新版本
@@ -173,56 +173,107 @@ def test_init_db_failed_migration_rolls_back(
     assert "half_migrated" in tables
 
 
-def test_init_db_schema_v2_and_reasoning_effort_column(dbfile: Path) -> None:
-    """v2 迁移：schema_version==2，sessions 表含 reasoning_effort TEXT（可 NULL）。
-
-    历史 v1 库的升级路径见 test_init_db_upgrades_v1_database_to_v2。
-    """
-    assert db.MIGRATIONS[-1][0] == 2
+def test_init_db_schema_v3_model_presets(dbfile: Path) -> None:
+    """v3 迁移：schema_version==3；新增 model_presets 表与 sessions.model_preset_id，
+    sessions 的旧模型配置列（base_url/api_key/model/reasoning_effort）已删除。"""
+    assert db.MIGRATIONS[-1][0] == 3
     conn = sqlite3.connect(str(dbfile))
     try:
         version = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-        columns = {row[1]: row for row in conn.execute("PRAGMA table_info(sessions)")}
+        tables = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        session_cols = {row[1]: row for row in conn.execute("PRAGMA table_info(sessions)")}
+        preset_cols = {row[1]: row for row in conn.execute("PRAGMA table_info(model_presets)")}
     finally:
         conn.close()
-    assert version == "2"
-    assert "reasoning_effort" in columns
-    # PRAGMA table_info 列：cid, name, type, notnull, dflt_value, pk
-    assert columns["reasoning_effort"][2] == "TEXT"
-    assert columns["reasoning_effort"][3] == 0   # 可 NULL（notnull=0）
-    assert columns["reasoning_effort"][4] is None  # 无默认值
+    assert version == "3"
+    assert "model_presets" in tables
+    # sessions：有 model_preset_id，旧模型配置列全部删除（§5 v0.6）
+    assert "model_preset_id" in session_cols
+    assert session_cols["model_preset_id"][2] == "TEXT"
+    assert session_cols["model_preset_id"][3] == 0  # 可 NULL = 未选择
+    for old_column in ("base_url", "api_key", "model", "reasoning_effort"):
+        assert old_column not in session_cols
+    # model_presets：与 §5 表结构逐字段对齐
+    assert set(preset_cols) == {
+        "id", "name", "base_url", "api_key", "model",
+        "reasoning_effort", "created_at", "updated_at",
+    }
+    assert preset_cols["id"][2] == "TEXT" and preset_cols["id"][5] == 1  # TEXT PK
+    assert preset_cols["reasoning_effort"][3] == 0  # 可 NULL = 不设置
+    for not_null_column in ("name", "base_url", "api_key", "model", "created_at", "updated_at"):
+        assert preset_cols[not_null_column][3] == 1, not_null_column  # NOT NULL
 
 
-def test_init_db_upgrades_v1_database_to_v2(tmp_path: Path) -> None:
-    """旧版 v1 库（含既有数据）启动时自动增量升级到 v2，数据保留且新列为 NULL。"""
+def _make_legacy_db(path: Path, version: int) -> None:
+    """构造真实历史版本的旧库（v1 / v2），用于验证 init_db 增量升级到 v3。
 
-    def _make_v1_db(path: Path) -> None:
-        conn = sqlite3.connect(str(path))
-        try:
-            conn.executescript(db.SCHEMA_V1)  # v1 建表（不含 reasoning_effort）
-            conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-            conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', '1')")
-            conn.execute(
-                "INSERT INTO sessions ("
-                " id, name, system_prompt, scan_rounds, worldbook_enabled, base_url,"
-                " api_key, model, temperature, top_p, max_tokens, max_context_chars,"
-                " proxy_url, created_at, updated_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                ("old-session", "旧会话", "旧提示词", 2, 0, "http://old", "sk-old",
-                 "old-model", 0.5, 0.8, 100, 5000, "", "2026-01-01T00:00:00.000000Z",
-                 "2026-01-02T00:00:00.000000Z"),
-            )
-            conn.execute(
-                "INSERT INTO messages (session_id, role, content, interrupted, created_at)"
-                " VALUES ('old-session', 'user', '旧消息', 0, '2026-01-01T00:00:00.000000Z')"
-            )
-            conn.commit()
-        finally:
-            conn.close()
+    直接执行历史 DDL 并写 meta.schema_version，不 monkeypatch MIGRATIONS，
+    保证验证的是"真实旧库 → 真实最新迁移"的升级路径。
+    """
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.executescript(db.SCHEMA_V1)  # v1 建表（不含 reasoning_effort）
+        if version >= 2:
+            conn.execute("ALTER TABLE sessions ADD COLUMN reasoning_effort TEXT")
+        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?)", (str(version),)
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
-    # 1) 构造 v1 库（含数据）
+
+def _insert_legacy_session(
+    path: Path,
+    session_id: str,
+    *,
+    version: int,
+    name: str,
+    base_url: str | None,
+    api_key: str,
+    model: str | None,
+    reasoning_effort: str | None = None,
+    created_at: str = "2026-01-01T00:00:00.000000Z",
+    updated_at: str = "2026-01-02T00:00:00.000000Z",
+) -> None:
+    """向旧库插入一条会话（v1/v2 列结构；含模型配置旧字段）。"""
+    columns = [
+        "id", "name", "system_prompt", "scan_rounds", "worldbook_enabled",
+        "base_url", "api_key", "model", "temperature", "top_p", "max_tokens",
+        "max_context_chars", "proxy_url", "created_at", "updated_at",
+    ]
+    values: list[object] = [
+        session_id, name, "旧提示词", 2, 0, base_url, api_key, model,
+        0.5, 0.8, 100, 5000, "", created_at, updated_at,
+    ]
+    if version >= 2:
+        columns.append("reasoning_effort")
+        values.append(reasoning_effort)
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            f"INSERT INTO sessions ({', '.join(columns)})"
+            f" VALUES ({', '.join('?' * len(columns))})",
+            tuple(values),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_init_db_upgrades_v1_database_to_v3(tmp_path: Path) -> None:
+    """v1 旧库（含既有数据）→ v2 → v3：回填预设、会话引用正确、旧列删除、数据保留。"""
     path = tmp_path / "legacy-v1.db"
-    _make_v1_db(path)
+    _make_legacy_db(path, 1)
+    _insert_legacy_session(
+        path, "old-session", version=1, name="旧会话",
+        base_url="http://old", api_key="sk-old", model="old-model",
+        created_at="2026-01-01T00:00:00.000000Z",
+        updated_at="2026-01-02T00:00:00.000000Z",
+    )
     conn = sqlite3.connect(str(path))
     try:
         assert conn.execute(
@@ -231,41 +282,180 @@ def test_init_db_upgrades_v1_database_to_v2(tmp_path: Path) -> None:
         assert "reasoning_effort" not in {
             row[1] for row in conn.execute("PRAGMA table_info(sessions)")
         }
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, interrupted, created_at)"
+            " VALUES ('old-session', 'user', '旧消息', 0, '2026-01-01T00:00:00.000000Z')"
+        )
+        conn.execute(
+            "INSERT INTO worldbook_entries (id, session_id, name, keywords, content, enabled, sort_order)"
+            " VALUES ('old-entry', 'old-session', '旧条目', '', '旧内容', 1, 1)"
+        )
+        conn.commit()
     finally:
         conn.close()
 
-    # 2) 启动 init_db → 自动增量升级到 v2
-    db.init_db(path)
+    db.init_db(path)  # 自动增量升级 v1 → v2 → v3
+
     conn = sqlite3.connect(str(path))
     try:
         version = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
-        row = conn.execute(
-            "SELECT name, reasoning_effort FROM sessions WHERE id='old-session'"
+        session_columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+        preset_rows = conn.execute("SELECT * FROM model_presets").fetchall()
+        preset_columns = [d[0] for d in conn.execute("SELECT * FROM model_presets").description]
+        session_row = conn.execute(
+            "SELECT name, scan_rounds, worldbook_enabled, temperature, top_p,"
+            " max_tokens, max_context_chars, model_preset_id"
+            " FROM sessions WHERE id='old-session'"
         ).fetchone()
         msg_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        wb_count = conn.execute("SELECT COUNT(*) FROM worldbook_entries").fetchone()[0]
+        backfill_marker = conn.execute(
+            "SELECT value FROM meta WHERE key='presets_backfilled'"
+        ).fetchone()
     finally:
         conn.close()
-    assert version == "2"
-    assert "reasoning_effort" in columns
-    assert row == ("旧会话", None)  # 既有数据保留；新列默认 NULL
-    assert msg_count == 1
 
-    # 3) 幂等：再次 init 不报错、版本不变
+    assert version == "3"
+    assert "model_preset_id" in session_columns
+    for old_column in ("base_url", "api_key", "model", "reasoning_effort"):
+        assert old_column not in session_columns  # 旧列已删除
+    assert backfill_marker == ("1",)
+
+    # v1 库升级：reasoning_effort 在 v2 中新增为 NULL → 预设推理强度为 NULL
+    preset = dict(zip(preset_columns, preset_rows[0]))
+    assert len(preset_rows) == 1
+    assert preset["name"] == "old-model"          # name = COALESCE(NULLIF(model,''),'默认模型')
+    assert preset["base_url"] == "http://old"
+    assert preset["api_key"] == "sk-old"
+    assert preset["model"] == "old-model"
+    assert preset["reasoning_effort"] is None
+    # 时间取会话 created_at/updated_at（真实时间线）
+    assert preset["created_at"] == "2026-01-01T00:00:00.000000Z"
+    assert preset["updated_at"] == "2026-01-02T00:00:00.000000Z"
+    # 会话引用回填的预设；其它字段与消息/世界书数据保留
+    assert session_row == (
+        "旧会话", 2, 0, 0.5, 0.8, 100, 5000, preset["id"],
+    )
+    assert msg_count == 1
+    assert wb_count == 1
+
+    # 幂等：再次 init 不报错、版本不变、不重复回填
     db.init_db(path)
     conn = sqlite3.connect(str(path))
     try:
         assert conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'"
-        ).fetchone()[0] == "2"
+        ).fetchone()[0] == "3"
+        assert conn.execute("SELECT COUNT(*) FROM model_presets").fetchone()[0] == 1
     finally:
         conn.close()
 
-    # 4) 升级后可正常通过 DAO 读写新列
+    # 升级后 DAO 可正常读写：会话含 model_preset_id，预设明文仅内部可取
     session = db.get_session_raw("old-session")
-    assert session is not None and session["reasoning_effort"] is None
-    updated = db.update_session("old-session", {"reasoning_effort": "medium"})
-    assert updated is not None and updated["reasoning_effort"] == "medium"
+    assert session is not None and session["model_preset_id"] == preset["id"]
+    assert "api_key" not in session  # v0.6：会话不再有敏感字段
+    raw_preset = db.get_model_preset_raw(preset["id"])
+    assert raw_preset is not None and raw_preset["api_key"] == "sk-old"
+    assert db.get_model_preset(preset["id"])["api_key"] == db.mask_key("sk-old")
+
+
+def test_init_db_upgrades_v2_database_to_v3_backfill_dedup(tmp_path: Path) -> None:
+    """v2 旧库（含多种配置会话）→ v3：按 (base_url,api_key,model,reasoning_effort)
+    去重回填预设、引用正确、未配置会话为 NULL、旧列删除、数据保留、幂等。"""
+    path = tmp_path / "legacy-v2.db"
+    _make_legacy_db(path, 2)
+    # 同配置（仅时间/名称不同）→ 应去重为同一个预设
+    _insert_legacy_session(
+        path, "s1", version=2, name="会话1", base_url="http://a", api_key="sk-a",
+        model="model-a", reasoning_effort="high",
+        created_at="2026-02-01T00:00:00.000000Z", updated_at="2026-02-02T00:00:00.000000Z",
+    )
+    _insert_legacy_session(
+        path, "s2", version=2, name="会话2", base_url="http://a", api_key="sk-a",
+        model="model-a", reasoning_effort="high",
+        created_at="2026-03-01T00:00:00.000000Z", updated_at="2026-03-02T00:00:00.000000Z",
+    )
+    # 仅推理强度不同 → 独立预设
+    _insert_legacy_session(
+        path, "s3", version=2, name="会话3", base_url="http://a", api_key="sk-a",
+        model="model-a", reasoning_effort=None,
+        created_at="2026-04-01T00:00:00.000000Z", updated_at="2026-04-02T00:00:00.000000Z",
+    )
+    # 完全没有模型配置（空串/NULL）→ 不生成预设，model_preset_id 为 NULL
+    _insert_legacy_session(
+        path, "s4", version=2, name="会话4", base_url=None, api_key="", model=None,
+    )
+    # 只有 API Key（本地免填 URL/模型）→ 也生成预设，name 回退为"默认模型"
+    _insert_legacy_session(
+        path, "s5", version=2, name="会话5", base_url=None, api_key="sk-only", model="",
+        created_at="2026-05-01T00:00:00.000000Z", updated_at="2026-05-02T00:00:00.000000Z",
+    )
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, interrupted, created_at)"
+            " VALUES ('s1', 'user', '历史消息', 0, '2026-02-01T00:00:00.000000Z')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    db.init_db(path)
+
+    conn = sqlite3.connect(str(path))
+    try:
+        version = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+        session_columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+        preset_rows = conn.execute(
+            "SELECT id, name, base_url, api_key, model, reasoning_effort,"
+            " created_at, updated_at FROM model_presets"
+        ).fetchall()
+        refs = dict(conn.execute("SELECT id, model_preset_id FROM sessions").fetchall())
+        names = dict(conn.execute("SELECT id, name FROM sessions").fetchall())
+        msg_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    finally:
+        conn.close()
+
+    assert version == "3"
+    for old_column in ("base_url", "api_key", "model", "reasoning_effort"):
+        assert old_column not in session_columns
+
+    presets = {
+        (row[2], row[3], row[4], row[5]): {
+            "id": row[0], "name": row[1], "created_at": row[6], "updated_at": row[7],
+        }
+        for row in preset_rows
+    }
+    assert len(presets) == 3  # 同配置去重（s1+s2 共用一个）+ 强度不同 + 仅 Key
+    group_high = presets[("http://a", "sk-a", "model-a", "high")]
+    group_none = presets[("http://a", "sk-a", "model-a", None)]
+    group_key_only = presets[("", "sk-only", "", None)]
+    # name 取模型名；空模型名回退"默认模型"
+    assert group_high["name"] == "model-a"
+    assert group_key_only["name"] == "默认模型"
+    # 同配置去重后时间取 MIN(created_at) / MAX(updated_at)
+    assert group_high["created_at"] == "2026-02-01T00:00:00.000000Z"
+    assert group_high["updated_at"] == "2026-03-02T00:00:00.000000Z"
+    # 会话引用：s1/s2 指向同一预设；s4 未配置 → NULL；s5 指向仅 Key 预设
+    assert refs["s1"] == refs["s2"] == group_high["id"]
+    assert refs["s3"] == group_none["id"]
+    assert refs["s4"] is None
+    assert refs["s5"] == group_key_only["id"]
+    # 数据保留（会话名、消息）
+    assert names["s1"] == "会话1"
+    assert msg_count == 1
+
+    # 幂等：再次 init 不重复回填
+    db.init_db(path)
+    conn = sqlite3.connect(str(path))
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM model_presets").fetchone()[0] == 3
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()[0] == "3"
+    finally:
+        conn.close()
+
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +479,8 @@ def test_mask_key() -> None:
 
 def test_create_session_defaults(dbfile: Path) -> None:
     """create_session 默认值严格照抄 §5.1：temperature/top_p 1.0、scan_rounds 4、
-    worldbook_enabled 1、max_context_chars 80000、proxy_url/system_prompt/api_key 空。"""
+    worldbook_enabled 1、max_context_chars 80000、proxy_url/system_prompt 空、
+    model_preset_id NULL（v0.6：未选择预设）。"""
     session = db.create_session("测试会话")
     assert session["name"] == "测试会话"
     assert session["temperature"] == 1.0
@@ -299,12 +490,11 @@ def test_create_session_defaults(dbfile: Path) -> None:
     assert session["max_context_chars"] == 80000
     assert session["proxy_url"] == ""
     assert session["system_prompt"] == ""
-    assert session["api_key"] == ""
-    assert session["base_url"] is None
-    assert session["model"] is None
+    assert session["model_preset_id"] is None  # v0.6：默认未选择预设
     assert session["max_tokens"] is None
-    # v0.5①：推理强度默认 NULL（不设置/不向上游发送）
-    assert session["reasoning_effort"] is None
+    # v0.6 起会话不再含旧的模型配置字段
+    for removed in ("base_url", "api_key", "model", "reasoning_effort"):
+        assert removed not in session, removed
     # id 为 UUID 形态（TEXT PK，§5）
     assert len(session["id"]) == 36 and session["id"].count("-") == 4
     # 时间字段为 UTC ISO8601
@@ -312,14 +502,13 @@ def test_create_session_defaults(dbfile: Path) -> None:
     assert ISO_RE.match(session["updated_at"])
 
 
-def test_list_sessions_order_count_and_mask(dbfile: Path) -> None:
-    """列表按 updated_at 倒序、附 message_count、api_key 打码。"""
+def test_list_sessions_order_count_and_no_secret_fields(dbfile: Path) -> None:
+    """列表按 updated_at 倒序、附 message_count；v0.6 起不再含 api_key 等字段。"""
     s1 = db.create_session("会话一")
     s2 = db.create_session("会话二")
     db.append_message(s1["id"], "user", "你好")
     db.append_message(s1["id"], "assistant", "在的")
     db.append_message(s2["id"], "user", "hi")
-    db.update_session(s1["id"], {"api_key": "sk-secret-key-12345678"})
     db.update_session(s2["id"], {"name": "会话二改"})  # s2 最后被触碰 → 排最前
 
     sessions = db.list_sessions()
@@ -327,23 +516,25 @@ def test_list_sessions_order_count_and_mask(dbfile: Path) -> None:
     by_id = {x["id"]: x for x in sessions}
     assert by_id[s1["id"]]["message_count"] == 2
     assert by_id[s2["id"]]["message_count"] == 1
-    assert by_id[s1["id"]]["api_key"] == db.mask_key("sk-secret-key-12345678")
-    assert by_id[s1["id"]]["api_key"] != "sk-secret-key-12345678"  # 明文不外泄
+    assert "model_preset_id" in by_id[s1["id"]]
+    for removed in ("base_url", "api_key", "model", "reasoning_effort"):
+        assert removed not in by_id[s1["id"]], removed
 
 
-def test_get_session_masked_and_raw(dbfile: Path) -> None:
-    """get_session 打码（§5.1 契约）；get_session_raw 供内部读取明文。"""
+def test_get_session_has_preset_ref_and_no_secret_fields(dbfile: Path) -> None:
+    """get_session / get_session_raw 返回会话详情（v0.6 已无敏感字段，两者一致）。"""
     session = db.create_session("s")
-    db.update_session(session["id"], {"api_key": "sk-raw-key-abcdef1234"})
+    preset = db.create_model_preset({"name": "p", "api_key": "sk-raw-key-abcdef1234"})
+    db.update_session(session["id"], {"model_preset_id": preset["id"]})
 
-    masked = db.get_session(session["id"])
-    assert masked is not None
-    assert masked["api_key"] == db.mask_key("sk-raw-key-abcdef1234")
-    assert masked["api_key"] != "sk-raw-key-abcdef1234"
+    viewed = db.get_session(session["id"])
+    assert viewed is not None
+    assert viewed["model_preset_id"] == preset["id"]
+    for removed in ("base_url", "api_key", "model", "reasoning_effort"):
+        assert removed not in viewed, removed
 
     raw = db.get_session_raw(session["id"])
-    assert raw is not None
-    assert raw["api_key"] == "sk-raw-key-abcdef1234"  # 原始值（仅供内部）
+    assert raw == viewed  # v0.6：会话无敏感字段，两个函数返回值相同
 
     assert db.get_session("不存在") is None
 
@@ -362,30 +553,49 @@ def test_update_session_partial_and_updated_at(dbfile: Path) -> None:
     assert db.update_session("missing", {"name": "x"}) is None  # 不存在返回 None
 
 
-def test_update_session_api_key_empty_not_updated(dbfile: Path) -> None:
-    """api_key 空值不更新（§4.3 PATCH 语义，DAO 兜底）。"""
+def test_update_session_ignores_removed_model_config_fields(dbfile: Path) -> None:
+    """v0.6：base_url/api_key/model/reasoning_effort 已从会话表删除，传入被忽略。"""
     session = db.create_session("s")
-    db.update_session(session["id"], {"api_key": "sk-keep-me-12345678"})
-    db.update_session(session["id"], {"api_key": ""})       # 空串 → 跳过
-    assert db.get_session_raw(session["id"])["api_key"] == "sk-keep-me-12345678"
-    db.update_session(session["id"], {"api_key": None})     # None → 跳过
-    assert db.get_session_raw(session["id"])["api_key"] == "sk-keep-me-12345678"
-    db.update_session(session["id"], {"api_key": "sk-new-key-87654321"})  # 非空才更新
-    assert db.get_session_raw(session["id"])["api_key"] == "sk-new-key-87654321"
+    updated = db.update_session(
+        session["id"],
+        {
+            "base_url": "http://ignored", "api_key": "sk-ignored", "model": "ignored",
+            "reasoning_effort": "high", "temperature": 0.9,
+        },
+    )
+    assert updated is not None
+    assert updated["temperature"] == 0.9   # 白名单字段正常更新
+    for removed in ("base_url", "api_key", "model", "reasoning_effort"):
+        assert removed not in updated, removed
+
+
+def test_update_session_model_preset_set_and_clear(dbfile: Path) -> None:
+    """v0.6③：model_preset_id 可设置；显式 null = 清除预设选择（未选择）。"""
+    preset = db.create_model_preset(
+        {"name": "p", "base_url": "http://x", "api_key": "sk-x", "model": "m"}
+    )
+    session = db.create_session("s")
+    assert session["model_preset_id"] is None
+
+    updated = db.update_session(session["id"], {"model_preset_id": preset["id"]})
+    assert updated is not None
+    assert updated["model_preset_id"] == preset["id"]
+    assert db.get_session_raw(session["id"])["model_preset_id"] == preset["id"]
+    # 列表路径同样回显
+    assert db.list_sessions()[0]["model_preset_id"] == preset["id"]
+
+    cleared = db.update_session(session["id"], {"model_preset_id": None})
+    assert cleared is not None
+    assert cleared["model_preset_id"] is None  # null = 清除选择
+    assert db.get_session_raw(session["id"])["model_preset_id"] is None
 
 
 def test_update_session_nullable_fields(dbfile: Path) -> None:
-    """可空配置列（base_url/model/max_tokens）可显式置 NULL 清除；
+    """可空配置列（max_tokens）可显式置 NULL 清除；
     proxy_url 为 NOT NULL 默认空串：传 None 视为未提供，清除用空串。"""
     session = db.create_session("s")
-    db.update_session(session["id"], {
-        "base_url": "http://x", "model": "gpt", "max_tokens": 100, "proxy_url": "http://p",
-    })
-    updated = db.update_session(session["id"], {
-        "base_url": None, "model": None, "max_tokens": None, "proxy_url": None,
-    })
-    assert updated["base_url"] is None
-    assert updated["model"] is None
+    db.update_session(session["id"], {"max_tokens": 100, "proxy_url": "http://p"})
+    updated = db.update_session(session["id"], {"max_tokens": None, "proxy_url": None})
     assert updated["max_tokens"] is None
     assert updated["proxy_url"] == "http://p"  # 非空列：None 视为未提供，值不变
     # 清除代理用空串（§5：空 = 直连）
@@ -393,26 +603,6 @@ def test_update_session_nullable_fields(dbfile: Path) -> None:
     assert cleared["proxy_url"] == ""
     # worldbook_enabled 存 0/1 整型
     assert db.update_session(session["id"], {"worldbook_enabled": False})["worldbook_enabled"] == 0
-
-
-def test_update_session_reasoning_effort_set_and_clear(dbfile: Path) -> None:
-    """v0.5①：reasoning_effort 可设置 low/medium/high；显式 null = 清除回 NULL。"""
-    session = db.create_session("s")
-    assert session["reasoning_effort"] is None  # 新会话默认 NULL
-
-    for value in ("low", "medium", "high"):
-        updated = db.update_session(session["id"], {"reasoning_effort": value})
-        assert updated is not None
-        assert updated["reasoning_effort"] == value
-        assert db.get_session_raw(session["id"])["reasoning_effort"] == value
-        # 列表路径同样回显该列
-        assert db.list_sessions()[0]["reasoning_effort"] == value
-
-    cleared = db.update_session(session["id"], {"reasoning_effort": None})
-    assert cleared is not None
-    assert cleared["reasoning_effort"] is None  # null = 清除配置（置 NULL）
-    assert db.get_session_raw(session["id"])["reasoning_effort"] is None
-    assert cleared["name"] == "s"  # 清除不影响其它字段
 
 
 def test_update_session_null_bool_not_updated(dbfile: Path) -> None:
@@ -446,6 +636,133 @@ def test_delete_session_cascades(dbfile: Path) -> None:
     assert db.list_messages(session["id"]) == []
     assert db.list_worldbook(session["id"]) == []
     assert db.delete_session(session["id"]) is False  # 再删返回 False
+
+
+# ---------------------------------------------------------------------------
+# 模型预设 DAO（v0.6，§5.1）
+# ---------------------------------------------------------------------------
+
+
+def test_model_preset_create_defaults(dbfile: Path) -> None:
+    """create_model_preset：仅 name 时其余字段取空串/NULL；UUID 主键与 ISO8601 时间。"""
+    preset = db.create_model_preset({"name": "默认预设"})
+    assert preset["name"] == "默认预设"
+    assert preset["base_url"] == ""
+    assert preset["api_key"] == ""
+    assert preset["model"] == ""
+    assert preset["reasoning_effort"] is None
+    assert len(preset["id"]) == 36 and preset["id"].count("-") == 4
+    assert ISO_RE.match(preset["created_at"])
+    assert ISO_RE.match(preset["updated_at"])
+    # 空串 reasoning_effort 归一为 NULL（NULL = 不设置/不发送）
+    preset2 = db.create_model_preset({"name": "p2", "reasoning_effort": ""})
+    assert preset2["reasoning_effort"] is None
+
+
+def test_model_preset_list_order_and_mask(dbfile: Path) -> None:
+    """list_model_presets：按 created_at 升序，api_key 打码且明文不外泄。"""
+    p1 = db.create_model_preset(
+        {"name": "甲", "base_url": "http://a", "api_key": "sk-aaaa1111bbbb2222", "model": "m1"}
+    )
+    p2 = db.create_model_preset(
+        {"name": "乙", "base_url": "http://b", "api_key": "sk-cccc3333dddd4444", "model": "m2"}
+    )
+    # 显式控制 created_at，避免同微秒导致排序不确定
+    conn = sqlite3.connect(str(dbfile))
+    try:
+        conn.execute(
+            "UPDATE model_presets SET created_at = ? WHERE id = ?",
+            ("2026-01-01T00:00:00.000000Z", p1["id"]),
+        )
+        conn.execute(
+            "UPDATE model_presets SET created_at = ? WHERE id = ?",
+            ("2026-01-02T00:00:00.000000Z", p2["id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    presets = db.list_model_presets()
+    assert [p["name"] for p in presets] == ["甲", "乙"]  # created_at 升序
+    by_id = {p["id"]: p for p in presets}
+    assert by_id[p1["id"]]["api_key"] == db.mask_key("sk-aaaa1111bbbb2222")
+    assert by_id[p2["id"]]["api_key"] == db.mask_key("sk-cccc3333dddd4444")
+    assert "sk-aaaa1111bbbb2222" not in str(presets)  # 明文不通过列表接口外泄
+    assert "sk-cccc3333dddd4444" not in str(presets)
+
+
+def test_model_preset_get_masked_and_raw(dbfile: Path) -> None:
+    """get_model_preset 打码；get_model_preset_raw 供 chat/test 内部取明文（§5.1）。"""
+    preset = db.create_model_preset(
+        {"name": "p", "api_key": "sk-raw-key-abcdef1234", "model": "m"}
+    )
+    masked = db.get_model_preset(preset["id"])
+    assert masked is not None
+    assert masked["api_key"] == db.mask_key("sk-raw-key-abcdef1234")
+    assert masked["api_key"] != "sk-raw-key-abcdef1234"
+
+    raw = db.get_model_preset_raw(preset["id"])
+    assert raw is not None
+    assert raw["api_key"] == "sk-raw-key-abcdef1234"  # 原始值（仅供内部）
+
+    assert db.get_model_preset("不存在") is None
+    assert db.get_model_preset_raw("不存在") is None
+
+
+def test_model_preset_update_partial_and_api_key_empty_not_updated(dbfile: Path) -> None:
+    """update_model_preset：仅更新传入字段；api_key 空值不更新；reasoning null = 清除。"""
+    preset = db.create_model_preset(
+        {"name": "原名", "base_url": "http://a", "api_key": "sk-keep-me-12345678", "model": "m1"}
+    )
+    old_updated_at = preset["updated_at"]
+
+    updated = db.update_model_preset(preset["id"], {"name": "新名", "model": "m2"})
+    assert updated is not None
+    assert updated["name"] == "新名"
+    assert updated["model"] == "m2"
+    assert updated["base_url"] == "http://a"  # 未传字段不动
+    assert updated["api_key"] == "sk-keep-me-12345678"
+    assert updated["updated_at"] != old_updated_at  # 自动刷新
+
+    # api_key 空串 / None → 不更新（避免把打码回显当明文写回）
+    db.update_model_preset(preset["id"], {"api_key": ""})
+    db.update_model_preset(preset["id"], {"api_key": None})
+    assert db.get_model_preset_raw(preset["id"])["api_key"] == "sk-keep-me-12345678"
+    # 非空才更新
+    db.update_model_preset(preset["id"], {"api_key": "sk-new-key-87654321"})
+    assert db.get_model_preset_raw(preset["id"])["api_key"] == "sk-new-key-87654321"
+
+    # reasoning_effort：设置 low/medium/high；显式 null = 清除（置 NULL）
+    for value in ("low", "medium", "high"):
+        row = db.update_model_preset(preset["id"], {"reasoning_effort": value})
+        assert row is not None and row["reasoning_effort"] == value
+        assert db.get_model_preset_raw(preset["id"])["reasoning_effort"] == value
+    cleared = db.update_model_preset(preset["id"], {"reasoning_effort": None})
+    assert cleared is not None and cleared["reasoning_effort"] is None
+
+    # 不存在 → None
+    assert db.update_model_preset("no-such", {"name": "x"}) is None
+
+
+def test_model_preset_delete_clears_session_references(dbfile: Path) -> None:
+    """delete_model_preset：删除预设并把引用会话 model_preset_id 置 NULL（§5.1）。"""
+    p1 = db.create_model_preset({"name": "p1"})
+    p2 = db.create_model_preset({"name": "p2"})
+    s1 = db.create_session("s1")
+    s2 = db.create_session("s2")
+    s3 = db.create_session("s3")
+    db.update_session(s1["id"], {"model_preset_id": p1["id"]})
+    db.update_session(s2["id"], {"model_preset_id": p1["id"]})
+    db.update_session(s3["id"], {"model_preset_id": p2["id"]})
+
+    assert db.delete_model_preset(p1["id"]) is True
+    assert db.get_model_preset(p1["id"]) is None
+    # 引用它的两个会话置 NULL（未选择），其它会话不受影响
+    assert db.get_session_raw(s1["id"])["model_preset_id"] is None
+    assert db.get_session_raw(s2["id"])["model_preset_id"] is None
+    assert db.get_session_raw(s3["id"])["model_preset_id"] == p2["id"]
+    # 再次删除返回 False
+    assert db.delete_model_preset(p1["id"]) is False
 
 
 # ---------------------------------------------------------------------------

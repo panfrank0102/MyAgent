@@ -20,6 +20,7 @@ namespace MyAgent.App;
 public partial class MainWindow : Window
 {
     private readonly IBackendService _backend;
+    private readonly IDialogService _dialogs;
     private readonly MainViewModel _viewModel;
 
     /// <summary>是否贴底跟随：用户上滚查看历史时暂停自动滚底，滚回底部后恢复。</summary>
@@ -34,6 +35,7 @@ public partial class MainWindow : Window
 
         // 组合根：由 App.OnStartup 按 config.json 的 mode 注入 FakeBackendService 或 RealApiBackendService
         _backend = backend;
+        _dialogs = dialogs;
         _viewModel = new MainViewModel(backend, dialogs);
         DataContext = _viewModel;
 
@@ -83,6 +85,24 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             _viewModel.ErrorText = "打开会话设置失败：" + ex.Message;
+        }
+    }
+
+    /// <summary>
+    /// v0.6 入口：打开全局设置窗口（模型预设管理，模态，Owner=this）。
+    /// 全局设置不影响会话列表展示，关闭后无需刷新；窗口自身负责错误条展示，
+    /// 这里兜底防止窗口装配异常变成未处理异常。
+    /// </summary>
+    private void OpenGlobalSettings_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            var window = new GlobalSettingsWindow(_backend, _dialogs) { Owner = this };
+            window.ShowDialog();
+        }
+        catch (Exception ex)
+        {
+            _viewModel.ErrorText = "打开全局设置失败：" + ex.Message;
         }
     }
 

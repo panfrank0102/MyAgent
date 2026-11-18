@@ -1,8 +1,8 @@
 """会话与消息接口路由测试（开发步骤 Step 3 完成标准）。
 
-重点：列表排序（updated_at 倒序）与 message_count、api_key 打码与非空更新、
-删单条级联数量、清空、limit 语义、404/422 统一错误格式
-{"error": {"code", "message"}}。
+重点：列表排序（updated_at 倒序）与 message_count、v0.6 model_preset_id 选择
+（设置/清除/不存在 400）、旧模型配置字段被忽略、删单条级联数量、清空、limit
+语义、404/422 统一错误格式 {"error": {"code", "message"}}。
 
 团队约定：fixture 写在本文件内（不创建 conftest.py / tests/__init__.py），
 使用 TestClient + tmp_path 临时数据库，不污染 data/app.db。
@@ -75,12 +75,15 @@ def test_create_session_defaults_and_list(client: TestClient) -> None:
     assert session["max_context_chars"] == 80000
     assert session["proxy_url"] == ""
     assert session["system_prompt"] == ""
-    assert session["api_key"] == ""
+    assert session["model_preset_id"] is None  # v0.6：默认未选择预设
+    for removed in ("base_url", "api_key", "model", "reasoning_effort"):
+        assert removed not in session, removed
 
     listed = client.get("/api/sessions").json()
     assert len(listed) == 1
     assert listed[0]["id"] == session["id"]
     assert listed[0]["message_count"] == 0
+    assert listed[0]["model_preset_id"] is None
 
 
 def test_list_sessions_order_by_updated_at_desc(client: TestClient) -> None:
@@ -142,76 +145,82 @@ def test_patch_null_bool_not_updated_false_updates(client: TestClient) -> None:
     assert resp.json()["worldbook_enabled"] is True
 
 
-def test_patch_api_key_masked_and_empty_not_update(client: TestClient) -> None:
-    """api_key：非空才更新；读路径（详情/列表/回显）一律打码。"""
+def _create_preset(client: TestClient, name: str = "预设") -> dict:
+    """POST /api/model-presets 并断言成功，返回预设 dict（api_key 已打码）。"""
+    resp = client.post(
+        "/api/model-presets",
+        json={
+            "name": name,
+            "base_url": "https://upstream.example.com/v1",
+            "api_key": "sk-preset-key-12345678",
+            "model": "preset-model",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def test_patch_model_preset_id_set_clear_and_echo(client: TestClient) -> None:
+    """v0.6③：PATCH model_preset_id 设置 → 回显/落库/列表；null = 清除选择。"""
+    session = _create_session(client)
+    assert session["model_preset_id"] is None
+    preset = _create_preset(client)
+
+    resp = client.patch(
+        f"/api/sessions/{session['id']}", json={"model_preset_id": preset["id"]}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["model_preset_id"] == preset["id"]  # PATCH 响应回显
+    assert db.get_session_raw(session["id"])["model_preset_id"] == preset["id"]  # 已落库
+    assert (
+        client.get(f"/api/sessions/{session['id']}").json()["model_preset_id"]
+        == preset["id"]
+    )  # GET 详情回显
+    assert client.get("/api/sessions").json()[0]["model_preset_id"] == preset["id"]
+
+    # 显式 null = 清除预设选择（未选择状态，聊天会提示选择预设）
+    resp = client.patch(f"/api/sessions/{session['id']}", json={"model_preset_id": None})
+    assert resp.status_code == 200
+    assert resp.json()["model_preset_id"] is None
+    assert db.get_session_raw(session["id"])["model_preset_id"] is None
+    assert client.get(f"/api/sessions/{session['id']}").json()["model_preset_id"] is None
+
+
+def test_patch_model_preset_id_missing_400(client: TestClient) -> None:
+    """v0.6③：PATCH 引用不存在的预设 → 400 bad_request（中文提示），不落库。"""
     session = _create_session(client)
     resp = client.patch(
-        f"/api/sessions/{session['id']}", json={"api_key": "sk-secret-key-12345678"}
+        f"/api/sessions/{session['id']}", json={"model_preset_id": "no-such-preset"}
+    )
+    assert resp.status_code == 400
+    body = resp.json()
+    assert set(body.keys()) == {"error"}
+    assert body["error"]["code"] == "bad_request"
+    assert "预设" in body["error"]["message"]  # 中文可读提示
+    assert db.get_session_raw(session["id"])["model_preset_id"] is None  # 校验失败不落库
+
+
+def test_patch_removed_model_config_fields_ignored(client: TestClient) -> None:
+    """v0.6：base_url/api_key/model/reasoning_effort 不再接受（传入被忽略，不报错）。"""
+    session = _create_session(client)
+    resp = client.patch(
+        f"/api/sessions/{session['id']}",
+        json={
+            "base_url": "http://ignored",
+            "api_key": "sk-ignored",
+            "model": "ignored-model",
+            "reasoning_effort": "high",
+            "temperature": 0.7,
+        },
     )
     assert resp.status_code == 200
-    assert resp.json()["api_key"] == db.mask_key("sk-secret-key-12345678")  # 打码回显
-
-    # 空值不更新
-    client.patch(f"/api/sessions/{session['id']}", json={"api_key": ""})
-    assert db.get_session_raw(session["id"])["api_key"] == "sk-secret-key-12345678"
-
-    # 详情与列表均打码
-    assert (
-        client.get(f"/api/sessions/{session['id']}").json()["api_key"]
-        == db.mask_key("sk-secret-key-12345678")
-    )
-    listed = client.get("/api/sessions").json()
-    assert listed[0]["api_key"] == db.mask_key("sk-secret-key-12345678")
-    assert "sk-secret-key-12345678" not in str(listed)
-
-
-def test_patch_reasoning_effort_set_clear_and_echo(client: TestClient) -> None:
-    """v0.5①：PATCH reasoning_effort 设置 low/medium/high → 回显；null 清除。"""
-    session = _create_session(client)
-    # 新会话默认 null，且列表/详情 JSON 均含该字段（契约冻结字段名）
-    assert session["reasoning_effort"] is None
-    assert "reasoning_effort" in client.get(f"/api/sessions/{session['id']}").json()
-    listed = client.get("/api/sessions").json()
-    assert "reasoning_effort" in listed[0]
-    assert listed[0]["reasoning_effort"] is None
-
-    for value in ("low", "medium", "high"):
-        resp = client.patch(
-            f"/api/sessions/{session['id']}", json={"reasoning_effort": value}
-        )
-        assert resp.status_code == 200, value
-        assert resp.json()["reasoning_effort"] == value  # PATCH 响应回显
-        assert db.get_session_raw(session["id"])["reasoning_effort"] == value  # 已落库
-        assert (
-            client.get(f"/api/sessions/{session['id']}").json()["reasoning_effort"] == value
-        )  # GET 详情回显
-        assert client.get("/api/sessions").json()[0]["reasoning_effort"] == value
-
-    # 显式 null = 清除配置（置 NULL，之后不向上游发送该字段）
-    resp = client.patch(f"/api/sessions/{session['id']}", json={"reasoning_effort": None})
-    assert resp.status_code == 200
-    assert resp.json()["reasoning_effort"] is None
-    assert db.get_session_raw(session["id"])["reasoning_effort"] is None
-    assert client.get(f"/api/sessions/{session['id']}").json()["reasoning_effort"] is None
-
-
-def test_patch_reasoning_effort_invalid_422(client: TestClient) -> None:
-    """v0.5①：reasoning_effort 仅接受 low/medium/high 或 null，否则 422 且不落库。"""
-    session = _create_session(client)
-    client.patch(f"/api/sessions/{session['id']}", json={"reasoning_effort": "high"})
-
-    for bad in ("extreme", "HIGH", "low ", "", "medium\n", 123):
-        resp = client.patch(
-            f"/api/sessions/{session['id']}", json={"reasoning_effort": bad}
-        )
-        assert resp.status_code == 422, bad
-        body = resp.json()
-        assert set(body.keys()) == {"error"}
-        # 走 main.py 全局 422 handler 的统一 code（不新造 code）
-        assert body["error"]["code"] == "validation_error"
-        assert isinstance(body["error"]["message"], str) and body["error"]["message"]
-        # 校验失败不落库：原值保持不变
-        assert db.get_session_raw(session["id"])["reasoning_effort"] == "high"
+    body = resp.json()
+    assert body["temperature"] == 0.7     # 白名单字段正常更新
+    for removed in ("base_url", "api_key", "model", "reasoning_effort"):
+        assert removed not in body, removed  # 响应模型已无旧字段
+    raw = db.get_session_raw(session["id"])
+    for removed in ("base_url", "api_key", "model", "reasoning_effort"):
+        assert removed not in raw, removed
 
 
 def test_not_found_error_shape(client: TestClient) -> None:

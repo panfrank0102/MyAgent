@@ -1,17 +1,20 @@
 """会话与消息接口路由（开发步骤 Step 3，契约：指导 §4.3 / §5.1）。
 
 端点一览（前缀 /api/sessions）：
-    GET    ""                                会话列表（updated_at 倒序、含 message_count、api_key 打码）
+    GET    ""                                会话列表（updated_at 倒序、含 message_count）
     POST   ""                                新建会话（默认值按 §5.1 create_session 契约）
-    GET    "/{session_id}"                   会话详情（api_key 打码）
-    PATCH  "/{session_id}"                   部分更新（api_key 空值不更新；打码回显）
+    GET    "/{session_id}"                   会话详情（v0.6：含 model_preset_id）
+    PATCH  "/{session_id}"                   部分更新（model_preset_id 校验预设存在；打码字段已移除）
     DELETE "/{session_id}"                   删除会话（级联删除消息与世界书条目）
     GET    "/{session_id}/messages"          历史消息（?limit=200，最新 limit 条按 id 正序，含 interrupted）
     DELETE "/{session_id}/messages"          清空历史
     DELETE "/{session_id}/messages/{msg_id}" 删单条（级联删除该条及其后，返回 {"deleted": N}）
 
+v0.6：会话不再持有 base_url / api_key / model / reasoning_effort（模型配置集中在
+全局模型预设，会话通过 model_preset_id 引用）；PATCH 传入不存在的预设 →
+400 bad_request（中文提示）。
 错误统一 {"error": {"code", "message"}}（§4.3）；会话不存在 404、消息不存在 404、
-无效参数 422。api_key 仅 PATCH 可写入，任何读路径一律打码（§5.1 安全约定）。
+无效参数 422。
 """
 
 from __future__ import annotations
@@ -38,9 +41,9 @@ router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
 @router.get("", response_model=list[SessionListOut])
 def list_sessions() -> list[dict]:
-    """会话列表：按 updated_at 倒序、含 message_count、api_key 打码（§4.3）。
+    """会话列表：按 updated_at 倒序、含 message_count（§4.3）。
 
-    打码与排序在 DAO 层完成（§5.1 list_sessions 契约）。
+    v0.6：会话已无 api_key 等模型配置字段（改由 model_preset_id 引用预设）。
     """
     return db.list_sessions()
 
@@ -49,16 +52,14 @@ def list_sessions() -> list[dict]:
 def create_session(payload: SessionCreate):
     """新建会话：body {"name": "..."}；其余字段按 §5.1 create_session 默认值。
 
-    返回完整会话（api_key 打码回显，与列表/详情保持一致）。
+    返回完整会话（v0.6：model_preset_id 默认 NULL = 未选择预设）。
     """
-    session = db.create_session(payload.name)
-    session["api_key"] = db.mask_key(session["api_key"])
-    return session
+    return db.create_session(payload.name)
 
 
 @router.get("/{session_id}", response_model=SessionOut)
 def get_session(session_id: str):
-    """会话详情：完整配置，api_key 打码（§4.3）。"""
+    """会话详情：完整配置（v0.6：含 model_preset_id，§4.3）。"""
     session = db.get_session(session_id)
     if session is None:
         return api_error(404, "session_not_found", "会话不存在")
@@ -71,17 +72,22 @@ def update_session(session_id: str, payload: SessionUpdate):
 
     语义要点：
     - 仅更新传入字段（exclude_unset，客户端未传的字段不动）；
-    - api_key 仅在传入非空值时更新（DAO 层兜底，见 db.update_session）；
-    - 响应 api_key 打码回显。
+    - 所有字段显式 null = 未提供/不更新，例外 max_tokens（清除配置）与
+      model_preset_id（清除预设选择），由 DAO 兜底；
+    - model_preset_id 非空时先校验预设存在（v0.6③：不存在 → 400 bad_request
+      中文提示），避免会话引用悬空预设；
+    - v0.6 起 base_url / api_key / model / reasoning_effort 不再接受（传入被忽略）。
     """
     if db.get_session(session_id) is None:
         return api_error(404, "session_not_found", "会话不存在")
     fields = payload.model_dump(exclude_unset=True)
+    preset_id = fields.get("model_preset_id")
+    if preset_id is not None and db.get_model_preset(preset_id) is None:
+        return api_error(400, "bad_request", "所选模型预设不存在，请重新选择")
     session = db.update_session(session_id, fields)
     if session is None:
         # 极端并发下会话刚被删除
         return api_error(404, "session_not_found", "会话不存在")
-    session["api_key"] = db.mask_key(session["api_key"])
     return session
 
 

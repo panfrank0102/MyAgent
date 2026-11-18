@@ -1,0 +1,260 @@
+<Window x:Class="MyAgent.App.Views.GlobalSettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:conv="clr-namespace:MyAgent.App.Converters"
+        Title="全局设置" Height="720" Width="940" MinHeight="560" MinWidth="820"
+        Background="White"
+        WindowStartupLocation="CenterOwner"
+        Loaded="Window_Loaded">
+  <Window.Resources>
+    <conv:BoolToVisibilityConverter x:Key="BoolToVis"/>
+
+    <Style x:Key="FieldLabel" TargetType="TextBlock">
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="Foreground" Value="#374151"/>
+      <Setter Property="Margin" Value="0,0,0,3"/>
+    </Style>
+
+    <Style x:Key="HintText" TargetType="TextBlock">
+      <Setter Property="FontSize" Value="11"/>
+      <Setter Property="Foreground" Value="#9CA3AF"/>
+      <Setter Property="TextWrapping" Value="Wrap"/>
+      <Setter Property="Margin" Value="0,3,0,0"/>
+    </Style>
+
+    <Style x:Key="FieldBox" TargetType="TextBox">
+      <Setter Property="Padding" Value="6,4"/>
+      <Setter Property="FontSize" Value="13"/>
+    </Style>
+
+    <!-- 左侧子设置栏条目：自绘模板去掉系统高亮，统一浅色（与主窗口会话列表风格一致） -->
+    <Style x:Key="SectionItemStyle" TargetType="ListBoxItem">
+      <Setter Property="Padding" Value="10,7"/>
+      <Setter Property="Margin" Value="4,1"/>
+      <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ListBoxItem">
+            <Border x:Name="Bd" Background="Transparent" CornerRadius="6" Padding="{TemplateBinding Padding}">
+              <ContentPresenter/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#F3F4F6"/>
+              </Trigger>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#DBEAFE"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <!-- 预设列表条目：预设名 + 模型名（选中即加载右侧表单） -->
+    <Style x:Key="PresetItemStyle" TargetType="ListBoxItem">
+      <Setter Property="Padding" Value="8,6"/>
+      <Setter Property="Margin" Value="4,1"/>
+      <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ListBoxItem">
+            <Border x:Name="Bd" Background="Transparent" CornerRadius="6" Padding="{TemplateBinding Padding}">
+              <ContentPresenter/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#F3F4F6"/>
+              </Trigger>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#DBEAFE"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
+
+  <Grid>
+    <Grid.ColumnDefinitions>
+      <!-- 左侧子设置栏 -->
+      <ColumnDefinition Width="180"/>
+      <!-- 右侧内容区 -->
+      <ColumnDefinition Width="*"/>
+    </Grid.ColumnDefinitions>
+
+    <!-- ================= 左侧子设置栏（集合绑定，首版仅“模型预设”，预留扩展） ================= -->
+    <Border Grid.Column="0" Background="#F9FAFB" BorderBrush="#E5E7EB" BorderThickness="0,0,1,0">
+      <Grid>
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+        <StackPanel Margin="16,14,16,10">
+          <TextBlock Text="全局设置" FontSize="16" FontWeight="Bold"/>
+          <TextBlock Text="应用于全部会话" FontSize="11" Foreground="#9CA3AF" Margin="0,2,0,0"/>
+        </StackPanel>
+        <ListBox Grid.Row="1"
+                 ItemsSource="{Binding Sections}"
+                 SelectedItem="{Binding SelectedSection, Mode=TwoWay}"
+                 DisplayMemberPath="Name"
+                 ItemContainerStyle="{StaticResource SectionItemStyle}"
+                 BorderThickness="0"
+                 Background="Transparent"
+                 ScrollViewer.HorizontalScrollBarVisibility="Disabled"/>
+      </Grid>
+    </Border>
+
+    <!-- ================= 右侧内容区：首版固定为“模型预设”面板 =================
+         结构预留：后续子设置页可再放一个 Grid 并绑定各自的可见性（侧栏 Key 驱动）。 -->
+    <Grid Grid.Column="1" Visibility="{Binding IsModelPresetsSection, Converter={StaticResource BoolToVis}}">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="*"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+      </Grid.RowDefinitions>
+
+      <!-- 内容区标题 -->
+      <Border Grid.Row="0" BorderBrush="#E5E7EB" BorderThickness="0,0,0,1">
+        <StackPanel Margin="18,12">
+          <TextBlock Text="模型预设" FontSize="17" FontWeight="Bold"/>
+          <TextBlock Text="全局共享的模型配置（Base URL / API Key / 模型名 / 推理强度）；会话在“会话设置”中选择其一。"
+                     FontSize="11" Foreground="#6B7280" Margin="0,3,0,0" TextWrapping="Wrap"/>
+        </StackPanel>
+      </Border>
+
+      <!-- 错误条（§10：请求失败统一错误条，不弹裸异常） -->
+      <Border Grid.Row="1" Background="#FEE2E2" Visibility="{Binding ShowError, Converter={StaticResource BoolToVis}}">
+        <DockPanel Margin="16,8">
+          <Button DockPanel.Dock="Right" Content="✕" Command="{Binding DismissErrorCommand}" Padding="6,0" FontSize="12"/>
+          <TextBlock Text="{Binding ErrorText}" Foreground="#B91C1C" TextWrapping="Wrap" VerticalAlignment="Center"/>
+        </DockPanel>
+      </Border>
+
+      <!-- 主体：左预设列表 ｜ 右编辑表单 -->
+      <Grid Grid.Row="2">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="236"/>
+          <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+
+        <!-- 预设列表 + 新建/删除 -->
+        <Border Grid.Column="0" BorderBrush="#E5E7EB" BorderThickness="0,0,1,0">
+          <Grid>
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="*"/>
+              <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <TextBlock Grid.Row="0" Text="预设列表" FontSize="12" Foreground="#374151" Margin="14,10,14,4"/>
+            <ListBox Grid.Row="1"
+                     x:Name="PresetListBox"
+                     ItemsSource="{Binding Presets}"
+                     SelectedItem="{Binding SelectedPreset, Mode=TwoWay}"
+                     ItemContainerStyle="{StaticResource PresetItemStyle}"
+                     BorderThickness="0"
+                     Background="Transparent"
+                     ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+              <ListBox.ItemTemplate>
+                <DataTemplate>
+                  <StackPanel>
+                    <TextBlock Text="{Binding Name}" FontWeight="SemiBold" FontSize="13" TextTrimming="CharacterEllipsis"/>
+                    <TextBlock Text="{Binding Model}" FontSize="11" Foreground="#6B7280"
+                               TextTrimming="CharacterEllipsis" Margin="0,2,0,0"/>
+                  </StackPanel>
+                </DataTemplate>
+              </ListBox.ItemTemplate>
+            </ListBox>
+            <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="10,8,10,12">
+              <Button Content="新建" Command="{Binding NewCommand}" Padding="14,4" Margin="0,0,8,0"/>
+              <Button Content="删除" Command="{Binding DeleteCommand}" Padding="14,4"
+                      ToolTip="删除需确认；引用该预设的会话将变为未选择"/>
+            </StackPanel>
+          </Grid>
+        </Border>
+
+        <!-- 编辑表单 -->
+        <ScrollViewer Grid.Column="1" VerticalScrollBarVisibility="Auto" Padding="18,12">
+          <StackPanel>
+            <TextBlock Text="{Binding FormTitle}" FontSize="14" FontWeight="SemiBold" Margin="0,0,0,10"/>
+
+            <!-- 预设名称 -->
+            <TextBlock Text="预设名称" Style="{StaticResource FieldLabel}"/>
+            <TextBox Text="{Binding PresetName, UpdateSourceTrigger=PropertyChanged}" Style="{StaticResource FieldBox}"/>
+            <TextBlock Text="必填，用于在会话设置的下拉中选择（允许重名）。" Style="{StaticResource HintText}"/>
+
+            <!-- Base URL -->
+            <TextBlock Text="Base URL" Style="{StaticResource FieldLabel}" Margin="0,12,0,3"/>
+            <TextBox Text="{Binding BaseUrl, UpdateSourceTrigger=PropertyChanged}" Style="{StaticResource FieldBox}"/>
+            <TextBlock Text="OpenAI 兼容接口地址，如 https://api.deepseek.com/v1。" Style="{StaticResource HintText}"/>
+
+            <!-- API Key（密码框，回显打码值） -->
+            <TextBlock Text="API Key" Style="{StaticResource FieldLabel}" Margin="0,12,0,3"/>
+            <PasswordBox x:Name="PresetApiKeyBox" Padding="6,4" FontSize="13"
+                         PasswordChanged="PresetApiKeyBox_PasswordChanged"
+                         ToolTip="打开时回显打码值；不修改则保存时不更新 Key"/>
+            <TextBlock Text="回显为打码值；未修改或留空 = 不更新已保存的 API Key（打码值不会作为明文提交）。"
+                       Style="{StaticResource HintText}"/>
+
+            <!-- 模型名 -->
+            <TextBlock Text="模型名" Style="{StaticResource FieldLabel}" Margin="0,12,0,3"/>
+            <TextBox Text="{Binding Model, UpdateSourceTrigger=PropertyChanged}" Style="{StaticResource FieldBox}"/>
+            <TextBlock Text="例如 deepseek-chat。" Style="{StaticResource HintText}"/>
+
+            <!-- 推理强度：空值 = 不设置 → 不向上游发送 reasoning_effort 参数 -->
+            <TextBlock Text="推理强度" Style="{StaticResource FieldLabel}" Margin="0,12,0,3"/>
+            <ComboBox x:Name="ReasoningEffortBox" Width="160" HorizontalAlignment="Left"
+                      FontSize="13" Padding="6,4" SelectedValuePath="Tag"
+                      SelectedValue="{Binding ReasoningEffortSelected, Mode=TwoWay}">
+              <ComboBoxItem Content="不设置" Tag=""/>
+              <ComboBoxItem Content="低" Tag="low"/>
+              <ComboBoxItem Content="中" Tag="medium"/>
+              <ComboBoxItem Content="高" Tag="high"/>
+            </ComboBox>
+            <TextBlock Text="部分模型不支持该参数：不设置即不向上游发送。" Style="{StaticResource HintText}"/>
+
+            <!-- 测试连接 -->
+            <StackPanel Orientation="Horizontal" Margin="0,16,0,0">
+              <Button Content="测试连接" Command="{Binding TestConnectionCommand}" Padding="14,5" VerticalAlignment="Center"/>
+              <TextBlock Text="{Binding TestResultText}" VerticalAlignment="Center" Margin="12,0,0,0"
+                         TextWrapping="Wrap" MaxWidth="420">
+                <TextBlock.Style>
+                  <Style TargetType="TextBlock">
+                    <Setter Property="Foreground" Value="#B91C1C"/>
+                    <Style.Triggers>
+                      <DataTrigger Binding="{Binding TestResultOk}" Value="True">
+                        <Setter Property="Foreground" Value="#047857"/>
+                      </DataTrigger>
+                    </Style.Triggers>
+                  </Style>
+                </TextBlock.Style>
+              </TextBlock>
+            </StackPanel>
+            <TextBlock Text="已保存且未改 Key 的预设使用服务端存储的 Key 测试；新建或改了 Key 时用当前表单值测试（代理为空 = 直连）。"
+                       Style="{StaticResource HintText}"/>
+          </StackPanel>
+        </ScrollViewer>
+      </Grid>
+
+      <!-- 成功提示条 -->
+      <Border Grid.Row="3" Background="#ECFDF5" Visibility="{Binding ShowStatus, Converter={StaticResource BoolToVis}}">
+        <TextBlock Text="{Binding StatusText}" Foreground="#047857" TextWrapping="Wrap" Margin="18,7"/>
+      </Border>
+
+      <!-- 底部按钮区 -->
+      <Border Grid.Row="4" BorderBrush="#E5E7EB" BorderThickness="0,1,0,0" Background="#F9FAFB">
+        <DockPanel Margin="18,10">
+          <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+            <Button Content="保存" Command="{Binding SaveCommand}" Padding="18,5" Margin="0,0,8,0" FontWeight="SemiBold"/>
+            <Button Content="关闭" Click="Close_Click" Padding="14,5"/>
+          </StackPanel>
+          <TextBlock Text="修改后记得点“保存”；删除预设有确认提示。"
+                     FontSize="11" Foreground="#9CA3AF" VerticalAlignment="Center"/>
+        </DockPanel>
+      </Border>
+    </Grid>
+  </Grid>
+</Window>

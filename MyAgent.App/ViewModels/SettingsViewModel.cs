@@ -1,3 +1,4 @@
+using System.Collections.ObjectModel;
 using System.Globalization;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
@@ -7,12 +8,34 @@ using MyAgent.App.Services;
 namespace MyAgent.App.ViewModels;
 
 /// <summary>
-/// 会话设置窗口视图模型（Step 12 / §8）：
-///  - 打开时 GET /api/sessions/{id} 拉取最新配置回显（失败显示错误条，不弹裸异常）；
+/// “模型预设”下拉选项（v0.6 会话设置）：Id 为空串表示“不选择”，其余为全局预设 id。
+/// 下拉显示 Name（预设名），SelectedItem 即本类实例；保存时取 Id 构造 patch.ModelPresetId。
+/// </summary>
+public sealed class ModelPresetOption
+{
+    public ModelPresetOption(string id, string name)
+    {
+        Id = id ?? "";
+        Name = name ?? "";
+    }
+
+    /// <summary>预设 id；空串 = 不选择（保存时 patch.ModelPresetId = null，清除选择）。</summary>
+    public string Id { get; }
+
+    /// <summary>下拉显示名（“不选择”或预设名）。</summary>
+    public string Name { get; }
+}
+
+/// <summary>
+/// 会话设置窗口视图模型（Step 12 / §8，v0.6 改造）：
+///  - v0.6 起会话不再持有 Base URL / API Key / 模型名 / 推理强度（统一由“全局设置 → 模型预设”管理），
+///    本页改为“模型预设”下拉（不选择 / 各预设），保存时 patch.ModelPresetId = 未选择 ? null : id；
+///    会话级“测试连接”按钮随之移除（连通性测试在全局设置的预设编辑中）；
+///  - 打开时先 GET /api/model-presets 填充下拉，再 GET /api/sessions/{id} 回显（失败显示错误条，不弹裸异常）；
 ///  - 保存 = 整表提交 <see cref="SessionConfigPatch"/>（空字符串字段发 ""、max_tokens 空 → null 清除、
-///    reasoning_effort 选“不设置” → null 清除（v0.5①）、api_key 未改动/为空 → 不发送），再回显服务端返回的快照；
-///  - 测试连接 = 收集表单当前值调用 TestConnectionAsync，结果以 Ok/Message 展示（服务层约定不抛异常）；
-///  - 数值与代理地址做本地校验：非法时禁用“保存”并给出提示，避免产生未处理异常。
+///    max_context_chars 空 → null 不更新、模型预设未选择 → null 清除选择），再回显服务端返回的快照；
+///  - 数值与代理地址做本地校验：非法时禁用“保存”并给出提示，避免产生未处理异常；
+///  - “管理模型预设…”按钮由视图层打开 GlobalSettingsWindow，关闭后调用 <see cref="ReloadModelPresetsAsync"/> 刷新下拉。
 /// 注意：本类刻意不使用 [ObservableProperty] 源生成器特性——新增 VM 用 ObservableObject.SetProperty
 /// 手写属性，这样离线 verify-shim（禁止修改）无需新增 GeneratedProps 文件也能 0 警告 0 错误编译。
 /// </summary>
@@ -30,31 +53,27 @@ public partial class SettingsViewModel : ObservableObject
     private bool _loaded;
     private bool _isBusy;
     private bool _configSaved;
-    private bool _apiKeyDirty;
 
-    /// <summary>密码框当前内容（未修改时等于打码值 MaskedApiKey）。</summary>
-    private string _apiKeyInput = "";
-    private string _maskedApiKey = "";
+    /// <summary>“不选择”选项的 Id（空串）。</summary>
+    private const string NoPresetId = "";
 
     // —— 表单字段（数值一律用 string 承载，便于表达“空”与非法输入，本地校验后再转换） ——
     private string _name = "";
     private string _systemPrompt = "";
     private string _scanRoundsText = "4";
     private bool _worldbookEnabled = true;
-    private string _baseUrl = "";
-    private string _model = "";
     private string _temperatureText = "1";
     private string _topPText = "1";
     private string _maxTokensText = "";
-    private string _reasoningEffortSelected = "";
     private string _maxContextCharsText = "80000";
     private string _proxyUrl = "";
+
+    // —— 模型预设下拉（v0.6） ——
+    private ModelPresetOption? _selectedModelPreset;
 
     private string _errorText = "";
     private string _statusText = "";
     private string _validationText = "正在加载配置…";
-    private string _testResultText = "";
-    private bool _testResultOk;
 
     public SettingsViewModel(IBackendService backend, string sessionId)
     {
@@ -62,9 +81,8 @@ public partial class SettingsViewModel : ObservableObject
         _sessionId = sessionId;
 
         // 用同步 RelayCommand 包 async 方法（与主窗口 SendOrStop 同理）：命令自身的可用性完全由
-        // CanSave/CanTest 控制，异步过程不依赖 AsyncRelayCommand 的执行期禁用语义。
+        // CanSave 控制，异步过程不依赖 AsyncRelayCommand 的执行期禁用语义。
         SaveCommand = new RelayCommand(() => _ = SaveAsync(), () => CanSave);
-        TestConnectionCommand = new RelayCommand(() => _ = TestConnectionAsync(), () => CanTest);
         DismissErrorCommand = new RelayCommand(() => ErrorText = "");
     }
 
@@ -75,16 +93,29 @@ public partial class SettingsViewModel : ObservableObject
     /// <summary>是否已经成功保存过（主窗口据此决定关闭后是否刷新列表/名）。</summary>
     public bool ConfigSaved => _configSaved;
 
-    /// <summary>打码后的 API Key（打开时回显到密码框；服务端只回显打码值）。</summary>
-    public string MaskedApiKey => _maskedApiKey;
-
-    /// <summary>用户是否改动过 API Key 密码框：未改动时保存不发送 api_key（§4.3 仅非空值更新）。</summary>
-    public bool IsApiKeyModified => _apiKeyDirty;
-
-    /// <summary>回显打码值变更通知：视图层据此刷新 PasswordBox（WPF 的 PasswordBox.Password 不可绑定）。</summary>
-    public event EventHandler? MaskedApiKeyChanged;
-
     // ---------------- 表单属性 ----------------
+
+    /// <summary>模型预设下拉选项：「不选择」+ 全部全局预设（打开时/管理窗口关闭后刷新）。</summary>
+    public ObservableCollection<ModelPresetOption> ModelPresetOptions { get; } = new();
+
+    /// <summary>
+    /// 当前选中的模型预设（SelectedItem 双向绑定）：Id 空串 = 不选择（保存时 patch.ModelPresetId = null）。
+    /// 打开时按会话的 ModelPresetId 回显；所选预设已被删除/列表暂不可用时保留一个占位项，避免误清除。
+    /// </summary>
+    public ModelPresetOption? SelectedModelPreset
+    {
+        get => _selectedModelPreset;
+        set
+        {
+            if (!SetProperty(ref _selectedModelPreset, value)) return;
+            OnPropertyChanged(nameof(ModelPresetHint));
+        }
+    }
+
+    /// <summary>模型预设字段下方提示：未选择时说明聊天会被提示先选择预设。</summary>
+    public string ModelPresetHint => _selectedModelPreset is { Id.Length: > 0 }
+        ? "聊天时使用该预设的 Base URL / API Key / 模型名 / 推理强度；可随时切换。"
+        : "未选择模型预设：聊天时会提示先选择模型预设（可点右侧“管理模型预设…”新建）。";
 
     public string Name
     {
@@ -122,26 +153,6 @@ public partial class SettingsViewModel : ObservableObject
         set => SetProperty(ref _worldbookEnabled, value);
     }
 
-    public string BaseUrl
-    {
-        get => _baseUrl;
-        set
-        {
-            if (!SetProperty(ref _baseUrl, value)) return;
-            Validate();
-        }
-    }
-
-    public string Model
-    {
-        get => _model;
-        set
-        {
-            if (!SetProperty(ref _model, value)) return;
-            Validate();
-        }
-    }
-
     public string TemperatureText
     {
         get => _temperatureText;
@@ -172,20 +183,6 @@ public partial class SettingsViewModel : ObservableObject
         }
     }
 
-    /// <summary>
-    /// 推理强度（v0.5①）："" = 不设置（不向上游发送该参数）/ "low" / "medium" / "high"。
-    /// 由 ComboBox（SelectedValue + Tag）双向绑定；契约只接受上述三档，故不做数值校验。
-    /// </summary>
-    public string ReasoningEffortSelected
-    {
-        get => _reasoningEffortSelected;
-        set
-        {
-            if (!SetProperty(ref _reasoningEffortSelected, value ?? "")) return;
-            Validate();
-        }
-    }
-
     public string MaxContextCharsText
     {
         get => _maxContextCharsText;
@@ -209,16 +206,12 @@ public partial class SettingsViewModel : ObservableObject
     // ---------------- 命令 ----------------
 
     public RelayCommand SaveCommand { get; }
-    public RelayCommand TestConnectionCommand { get; }
     public RelayCommand DismissErrorCommand { get; }
 
     /// <summary>保存可用：已成功加载、非忙碌、且表单本地校验通过。</summary>
     public bool CanSave => _loaded && !_isBusy && IsFormValid;
 
-    /// <summary>测试连接可用：非忙碌即可（不强制先保存；表单值直接用于探测）。</summary>
-    public bool CanTest => !_isBusy;
-
-    // ---------------- 错误条 / 成功提示 / 校验提示 / 测试结果 ----------------
+    // ---------------- 错误条 / 成功提示 / 校验提示 ----------------
 
     public string ErrorText
     {
@@ -258,18 +251,6 @@ public partial class SettingsViewModel : ObservableObject
 
     public bool IsFormValid => _validationText.Length == 0;
 
-    public string TestResultText
-    {
-        get => _testResultText;
-        private set => SetProperty(ref _testResultText, value);
-    }
-
-    public bool TestResultOk
-    {
-        get => _testResultOk;
-        private set => SetProperty(ref _testResultOk, value);
-    }
-
     private bool IsBusy
     {
         get => _isBusy;
@@ -277,25 +258,36 @@ public partial class SettingsViewModel : ObservableObject
         {
             if (!SetProperty(ref _isBusy, value)) return;
             OnPropertyChanged(nameof(CanSave));
-            OnPropertyChanged(nameof(CanTest));
             RefreshCommands();
         }
     }
 
-    // ---------------- 加载 / 保存 / 测试连接 ----------------
+    // ---------------- 加载 / 保存 ----------------
 
-    /// <summary>打开窗口时拉取会话详情并回显；失败只设置错误条（保存保持禁用）。</summary>
+    /// <summary>
+    /// 打开窗口时加载：先 ListModelPresetsAsync 填充模型预设下拉，再 GetSessionAsync 回显会话配置。
+    /// 两者失败都只设置错误条（不崩）；预设列表失败不阻塞会话字段编辑/保存。
+    /// </summary>
     public async Task LoadAsync(CancellationToken ct = default)
     {
         _isLoading = true;
         _loaded = false;
         ErrorText = "";
         StatusText = "";
-        TestResultText = "";
         Validate();
         IsBusy = true;
         try
         {
+            // 顺序要求：先预设下拉，再会话回显（回显时才能按 ModelPresetId 选中对应项）
+            try
+            {
+                await LoadModelPresetOptionsAsync(NoPresetId, ct);
+            }
+            catch (Exception ex)
+            {
+                ErrorText = "加载模型预设失败：" + ex.Message;
+            }
+
             var info = await _backend.GetSessionAsync(_sessionId, ct);
             if (info == null)
             {
@@ -319,10 +311,30 @@ public partial class SettingsViewModel : ObservableObject
     }
 
     /// <summary>
+    /// 重新加载模型预设下拉（全局设置窗口关闭后由视图层调用）：保留当前选择（按 id）；
+    /// 当前预设已被删除时回退到“不选择”。失败只显示错误条（§10）。
+    /// </summary>
+    public async Task ReloadModelPresetsAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            await LoadModelPresetOptionsAsync(null, ct);
+            // 若已加载会话、且服务端会话的 ModelPresetId 与当前选择不一致（例如别处切换过），以当前会话为准
+            ErrorText = "";
+        }
+        catch (Exception ex)
+        {
+            ErrorText = "刷新模型预设列表失败：" + ex.Message;
+        }
+    }
+
+    /// <summary>
     /// 整表保存：构建 <see cref="SessionConfigPatch"/> 并 PATCH；成功回显服务端快照。
-    /// 语义（契约冻结）：空字符串字段发 ""；max_tokens 空 → null（清除，上游默认）；
-    /// reasoning_effort 选“不设置” → null（清除，v0.5①）；
-    /// max_context_chars 空 → null（未提供，不更新）；api_key 未改动/为空 → 不发送。
+    /// 语义（契约冻结，§4.3）：
+    ///  - 会话名剔空白后提交；系统提示词原样；扫描轮数/温度/top_p 已通过本地校验；
+    ///  - max_tokens 空 → null（清除，上游默认）；max_context_chars 空 → null（未提供，不更新）；
+    ///  - model_preset_id：未选择 → null（v0.6③：显式 null = 清除选择），选择 → 预设 id；
+    ///  - v0.6 起不再提交 base_url / api_key / model / reasoning_effort（会话已无这些字段）。
     /// </summary>
     public async Task SaveAsync(CancellationToken ct = default)
     {
@@ -360,74 +372,27 @@ public partial class SettingsViewModel : ObservableObject
         }
     }
 
-    /// <summary>测试连接：收集表单当前值 → TestConnectionAsync → 展示 Ok/Message（失败不抛异常）。</summary>
-    public async Task TestConnectionAsync(CancellationToken ct = default)
-    {
-        if (_isBusy) return;
-
-        // 代理格式非法时先本地拦截，避免把明显错误的地址发到后端
-        if (!IsProxyUrlValid(_proxyUrl))
-        {
-            TestResultOk = false;
-            TestResultText = "代理地址格式不正确：需以 http:// 或 https:// 开头（留空 = 直连）。";
-            return;
-        }
-
-        // 未改动 API Key 时密码框里只有打码值（不是可用的明文 Key）：测试请求改为发送空 key，
-        // 本地模型/直连场景可用；需要验证鉴权时请重新输入完整 Key。
-        var request = new TestConnectionRequest
-        {
-            BaseUrl = _baseUrl.Trim(),
-            ApiKey = _apiKeyDirty ? _apiKeyInput : "",
-            Model = _model.Trim(),
-            ProxyUrl = _proxyUrl.Trim(),
-        };
-
-        IsBusy = true;
-        ErrorText = "";
-        TestResultOk = false;
-        TestResultText = "正在测试连接…";
-        try
-        {
-            var result = await _backend.TestConnectionAsync(request, ct);
-            TestResultOk = result.Ok;
-            if (result.Ok)
-            {
-                TestResultText = string.IsNullOrWhiteSpace(result.Message) ? "连接成功。" : "连接成功：" + result.Message;
-            }
-            else
-            {
-                var reason = !string.IsNullOrWhiteSpace(result.Message)
-                    ? result.Message
-                    : (!string.IsNullOrWhiteSpace(result.ErrorCode) ? result.ErrorCode! : "未知原因");
-                TestResultText = "连接失败：" + reason;
-            }
-        }
-        catch (Exception ex)
-        {
-            // 契约约定 TestConnectionAsync 不抛异常；这里兜底防止未观察异常（§10）
-            TestResultOk = false;
-            TestResultText = "测试连接失败：" + ex.Message;
-        }
-        finally
-        {
-            IsBusy = false;
-        }
-    }
-
-    // ---------------- 视图层桥接（PasswordBox 不可绑定） ----------------
-
-    /// <summary>PasswordBox 内容变化（用户输入）时调用：记录输入并标记是否与打码值不同。</summary>
-    public void SetApiKeyInputFromView(string password)
-    {
-        password ??= "";
-        if (string.Equals(_apiKeyInput, password, StringComparison.Ordinal)) return;
-        _apiKeyInput = password;
-        _apiKeyDirty = !string.Equals(password, _maskedApiKey, StringComparison.Ordinal);
-        OnPropertyChanged(nameof(IsApiKeyModified));
-    }
-
     // ---------------- 内部实现 ----------------
+
+    /// <summary>
+    /// 加载预设下拉：首项固定为“不选择”，其后为全部预设（显示 Name）。
+    /// preferPresetId 为 null 时保留当前选择（按 id）；找不到时回退到“不选择”。
+    /// </summary>
+    private async Task LoadModelPresetOptionsAsync(string? preferPresetId, CancellationToken ct)
+    {
+        var presets = await _backend.ListModelPresetsAsync(ct);
+
+        string targetId = preferPresetId ?? _selectedModelPreset?.Id ?? NoPresetId;
+        var options = new List<ModelPresetOption> { new(NoPresetId, "不选择") };
+        options.AddRange(presets.Select(p => new ModelPresetOption(p.Id, p.Name)));
+
+        ModelPresetOptions.Clear();
+        foreach (var option in options) ModelPresetOptions.Add(option);
+
+        SelectedModelPreset = options.FirstOrDefault(o => o.Id == targetId)
+                              ?? options.FirstOrDefault(o => o.Id == NoPresetId)
+                              ?? options[0];
+    }
 
     private void ApplyInfo(SessionInfo info)
     {
@@ -435,26 +400,32 @@ public partial class SettingsViewModel : ObservableObject
         SystemPrompt = info.SystemPrompt;
         ScanRoundsText = info.ScanRounds.ToString(CultureInfo.InvariantCulture);
         WorldbookEnabled = info.WorldbookEnabled;
-        BaseUrl = info.BaseUrl;
-        Model = info.Model;
         TemperatureText = FormatNumber(info.Temperature);
         TopPText = FormatNumber(info.TopP);
         MaxTokensText = info.MaxTokens?.ToString(CultureInfo.InvariantCulture) ?? "";
-        // v0.5①：后端 NULL → 空串（“不设置”），其他值原样回显
-        ReasoningEffortSelected = string.IsNullOrEmpty(info.ReasoningEffort) ? "" : info.ReasoningEffort;
         MaxContextCharsText = info.MaxContextChars.ToString(CultureInfo.InvariantCulture);
         ProxyUrl = info.ProxyUrl;
-        SetMaskedApiKey(info.MaskedApiKey);
+        SelectModelPreset(info.ModelPresetId);
     }
 
-    private void SetMaskedApiKey(string masked)
+    /// <summary>
+    /// 按会话的 model_preset_id 回显下拉选择。
+    /// 若下拉里没有该 id（预设列表加载失败/数据不一致），补一个占位项并保留 id：
+    /// 避免用户仅保存其它字段时把会话的预设选择误清除（占位项仍提交原 id）。
+    /// </summary>
+    private void SelectModelPreset(string? presetId)
     {
-        _maskedApiKey = masked ?? "";
-        _apiKeyInput = _maskedApiKey;
-        _apiKeyDirty = false;
-        OnPropertyChanged(nameof(MaskedApiKey));
-        OnPropertyChanged(nameof(IsApiKeyModified));
-        MaskedApiKeyChanged?.Invoke(this, EventArgs.Empty);
+        string id = presetId ?? NoPresetId;
+        var option = ModelPresetOptions.FirstOrDefault(o => o.Id == id);
+        if (option == null && id.Length > 0)
+        {
+            option = new ModelPresetOption(id, "（无法获取该预设信息）");
+            ModelPresetOptions.Add(option);
+        }
+
+        SelectedModelPreset = option
+                              ?? ModelPresetOptions.FirstOrDefault(o => o.Id == NoPresetId)
+                              ?? (ModelPresetOptions.Count > 0 ? ModelPresetOptions[0] : null);
     }
 
     private SessionConfigPatch BuildPatch()
@@ -465,23 +436,19 @@ public partial class SettingsViewModel : ObservableObject
             SystemPrompt = _systemPrompt,
             ScanRounds = TryParseInt(_scanRoundsText, out int scanRounds) ? Math.Max(0, scanRounds) : 0,
             WorldbookEnabled = _worldbookEnabled,
-            BaseUrl = _baseUrl.Trim(),
-            // 契约：仅非空值更新 API Key；未改动或空白 = 不发送
-            ApiKey = _apiKeyDirty && _apiKeyInput.Length > 0 ? _apiKeyInput : null,
-            Model = _model.Trim(),
             Temperature = TryParseDouble(_temperatureText, out double temperature) ? temperature : 1.0,
             TopP = TryParseDouble(_topPText, out double topP) ? topP : 1.0,
             // 空文本框 = 清除配置（null），对应上游默认
             MaxTokens = _maxTokensText.Trim().Length == 0
                 ? null
                 : (TryParseInt(_maxTokensText, out int maxTokens) ? maxTokens : null),
-            // v0.5①：空选择 = 不设置（null = 清除配置，不向上游发送该参数）；其余原样提交
-            ReasoningEffort = string.IsNullOrEmpty(_reasoningEffortSelected) ? null : _reasoningEffortSelected,
             // 空文本框 = 未提供、不更新（其余字段的 null 语义，§4.3）
             MaxContextChars = _maxContextCharsText.Trim().Length == 0
                 ? null
                 : (TryParseInt(_maxContextCharsText, out int maxContextChars) ? maxContextChars : null),
             ProxyUrl = _proxyUrl.Trim(),
+            // v0.6③：null = 清除选择；字符串 = 选择该全局模型预设
+            ModelPresetId = _selectedModelPreset is { Id.Length: > 0 } selected ? selected.Id : null,
         };
     }
 
@@ -538,14 +505,12 @@ public partial class SettingsViewModel : ObservableObject
         ValidationText = error;
         OnPropertyChanged(nameof(IsFormValid));
         OnPropertyChanged(nameof(CanSave));
-        OnPropertyChanged(nameof(CanTest));
         RefreshCommands();
     }
 
     private void RefreshCommands()
     {
         SaveCommand.NotifyCanExecuteChanged();
-        TestConnectionCommand.NotifyCanExecuteChanged();
     }
 
     /// <summary>代理地址：空 = 直连；否则必须是带主机的 http/https 绝对地址。</summary>

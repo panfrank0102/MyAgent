@@ -9,11 +9,12 @@ namespace MyAgent.App.Services;
 /// 供前端在真实 Python 后端就绪前完成 Step 9-11 的界面开发与演示。
 ///
 /// 模拟内容：
-///  1. 会话/消息 CRUD（含删单条级联、清空历史、按 updated_at 倒序列表、api_key 打码）；
-///  2. 流式生成：meta（世界书命中）→ delta*（随机分块 + 随机延迟，模拟逐 token 到达）→ done|error；
-///  3. 停止语义：CancellationToken 取消后，把已生成部分以 interrupted=1 落库（§4.2 / §6.1 第 9 步）；
-///  4. 世界书匹配：纯子串匹配、ASCII 忽略大小写、按 sort_order 顺序返回、禁用条目跳过（§6.1 第 3 点）；
-///  5. 失败演示：用户输入包含“模拟失败”时返回 error 事件（用户消息保留，可点“重试”恢复）。
+///  1. 会话/消息 CRUD（含删单条级联、清空历史、按 updated_at 倒序列表）；
+///  2. 全局模型预设 CRUD（v0.6：api_key 打码回显、删除预设时引用会话自动置未选择）+ 测试连接模拟；
+///  3. 流式生成：meta（世界书命中）→ delta*（随机分块 + 随机延迟，模拟逐 token 到达）→ done|error；
+///  4. 停止语义：CancellationToken 取消后，把已生成部分以 interrupted=1 落库（§4.2 / §6.1 第 9 步）；
+///  5. 世界书匹配：纯子串匹配、ASCII 忽略大小写、按 sort_order 顺序返回、禁用条目跳过（§6.1 第 3 点）；
+///  6. 失败演示：用户输入包含“模拟失败”时返回 error 事件（用户消息保留，可点“重试”恢复）。
 ///
 /// 集成阶段由 ApiClient 按 IBackendService 同一接口替换本类，界面层无需改动。
 /// 所有“网络延迟”用 Task.Delay 模拟，便于演示流式 UI 与 30ms 节流。
@@ -24,12 +25,18 @@ public sealed class FakeBackendService : IBackendService
     private readonly object _lock = new();
 
     private readonly List<SessionInfo> _sessions = new();
+    private readonly List<ModelPreset> _modelPresets = new();
     private readonly Dictionary<string, List<ChatMessage>> _messages = new();
     private readonly Dictionary<string, List<WorldBookEntry>> _worldbooks = new();
     private readonly Dictionary<string, int> _generationCounts = new();
 
     /// <summary>固定种子：演示行为可复现，便于验收对照。</summary>
     private readonly Random _random = new(20261118);
+
+    /// <summary>推理强度合法值（§4.3 / §5：空 = 不设置；仅 low / medium / high，大小写不敏感）。</summary>
+    private static readonly HashSet<string> AllowedReasoningEfforts =
+        new(StringComparer.OrdinalIgnoreCase) { "low", "medium", "high" };
+
     private long _nextMessageId = 1;
 
     public FakeBackendService() => Seed();
@@ -159,22 +166,20 @@ public sealed class FakeBackendService : IBackendService
             var session = _sessions.FirstOrDefault(s => s.Id == id);
             if (session == null) return null;
 
-            // v0.4① 语义：null = 未提供（跳过）；例外——base_url/model/max_tokens 的 null 表示清除配置。
-            // 设置页总是整表提交，max_tokens 为 null 即“清除，上游默认”。
+            // v0.4① 语义：null = 未提供（跳过）；设置页整表提交，max_tokens 为 null 即“清除，上游默认”。
             if (patch.Name != null) session.Name = patch.Name.Trim();
             if (patch.SystemPrompt != null) session.SystemPrompt = patch.SystemPrompt;
             if (patch.ScanRounds.HasValue) session.ScanRounds = Math.Max(0, patch.ScanRounds.Value);
             if (patch.WorldbookEnabled.HasValue) session.WorldbookEnabled = patch.WorldbookEnabled.Value;
-            if (patch.BaseUrl != null) session.BaseUrl = patch.BaseUrl;
-            if (patch.Model != null) session.Model = patch.Model;
             session.MaxTokens = patch.MaxTokens; // null = 清除（上游默认）
-            // v0.5①：推理强度整表保存；null = 清除（Fake 用空串表示“不设置/不向上游发送”），值原样存
-            session.ReasoningEffort = patch.ReasoningEffort ?? "";
             if (patch.Temperature.HasValue) session.Temperature = patch.Temperature.Value;
             if (patch.TopP.HasValue) session.TopP = patch.TopP.Value;
             if (patch.MaxContextChars.HasValue) session.MaxContextChars = Math.Max(0, patch.MaxContextChars.Value);
             if (patch.ProxyUrl != null) session.ProxyUrl = patch.ProxyUrl;
-            if (!string.IsNullOrWhiteSpace(patch.ApiKey)) session.MaskedApiKey = MaskKey(patch.ApiKey);
+
+            // v0.6③：会话模型配置改为选择全局预设。null = 清除选择（未选择），否则存预设 id。
+            // 旧的 base_url/api_key/model/reasoning_effort 字段已废弃（§4.3 v0.6：后端不再接受），不再应用。
+            session.ModelPresetId = patch.ModelPresetId ?? "";
 
             session.UpdatedAt = DateTimeOffset.UtcNow; // §5.1：更新自动刷新 updated_at
             return CloneWithCount(session);
@@ -274,22 +279,138 @@ public sealed class FakeBackendService : IBackendService
         };
     }
 
-    // ---------------- 全局模型预设（v0.6，待 services 智能体实现） ----------------
+    // ---------------- 全局模型预设（v0.6，全局设置 → 模型预设，§4.3） ----------------
 
-    public Task<IReadOnlyList<ModelPreset>> ListModelPresetsAsync(CancellationToken ct = default)
-        => throw new NotImplementedException("模型预设尚未实现（v0.6 frontend-services 智能体实现）");
+    /// <summary>GET /api/model-presets：按 created_at 升序，api_key 仅以打码值回显。</summary>
+    public async Task<IReadOnlyList<ModelPreset>> ListModelPresetsAsync(CancellationToken ct = default)
+    {
+        await Task.Delay(20, ct);
+        lock (_lock)
+        {
+            // 返回克隆快照：调用方修改不会影响 Fake 内部状态
+            return _modelPresets.OrderBy(p => p.CreatedAt).Select(p => p.Clone()).ToList();
+        }
+    }
 
-    public Task<ModelPreset> CreateModelPresetAsync(ModelPreset preset, CancellationToken ct = default)
-        => throw new NotImplementedException("模型预设尚未实现（v0.6 frontend-services 智能体实现）");
+    /// <summary>
+    /// POST /api/model-presets：新建预设（name 非空、reasoning_effort 合法）。
+    /// ApiKeyInput 非空时只保存打码值（模拟后端明文入库、接口仅回显打码值）。
+    /// </summary>
+    public async Task<ModelPreset> CreateModelPresetAsync(ModelPreset preset, CancellationToken ct = default)
+    {
+        await Task.Delay(30, ct);
+        lock (_lock)
+        {
+            // 先校验，校验失败不落库（与后端 422/400 语义一致）
+            var name = NormalizePresetName(preset);
+            var reasoning = NormalizeReasoningEffort(preset.ReasoningEffort);
+            var baseUrl = (preset.BaseUrl ?? "").Trim();
+            var model = (preset.Model ?? "").Trim();
+            var apiKeyInput = (preset.ApiKeyInput ?? "").Trim();
 
-    public Task<ModelPreset?> UpdateModelPresetAsync(string id, ModelPreset preset, CancellationToken ct = default)
-        => throw new NotImplementedException("模型预设尚未实现（v0.6 frontend-services 智能体实现）");
+            var now = DateTimeOffset.UtcNow;
+            var created = new ModelPreset
+            {
+                // 后端由数据库生成 UUID，Fake 同样忽略调用方传入的 Id
+                Id = Guid.NewGuid().ToString(),
+                Name = name,
+                BaseUrl = baseUrl,
+                MaskedApiKey = apiKeyInput.Length > 0 ? MaskKey(apiKeyInput) : "",
+                ApiKeyInput = "", // 明文不保存在返回快照中
+                Model = model,
+                ReasoningEffort = reasoning,
+                CreatedAt = now,
+                UpdatedAt = now,
+            };
+            _modelPresets.Add(created);
+            return created.Clone();
+        }
+    }
 
-    public Task<bool> DeleteModelPresetAsync(string id, CancellationToken ct = default)
-        => throw new NotImplementedException("模型预设尚未实现（v0.6 frontend-services 智能体实现）");
+    /// <summary>
+    /// PATCH /api/model-presets/{id}：整表更新（name 非空、reasoning_effort 合法）。
+    /// ApiKeyInput 为 null/空串 → 不更新已存 Key（打码值保持不变）；不存在返回 null。
+    /// </summary>
+    public async Task<ModelPreset?> UpdateModelPresetAsync(string id, ModelPreset preset, CancellationToken ct = default)
+    {
+        await Task.Delay(30, ct);
+        lock (_lock)
+        {
+            var existing = _modelPresets.FirstOrDefault(p => p.Id == id);
+            if (existing == null) return null;
 
-    public Task<TestConnectionResult> TestModelPresetAsync(string id, CancellationToken ct = default)
-        => throw new NotImplementedException("模型预设尚未实现（v0.6 frontend-services 智能体实现）");
+            // 先校验再修改，避免校验失败时留下半更新状态
+            var name = NormalizePresetName(preset);
+            var reasoning = NormalizeReasoningEffort(preset.ReasoningEffort);
+            var baseUrl = (preset.BaseUrl ?? "").Trim();
+            var model = (preset.Model ?? "").Trim();
+            var apiKeyInput = (preset.ApiKeyInput ?? "").Trim();
+
+            existing.Name = name;
+            existing.BaseUrl = baseUrl;
+            existing.Model = model;
+            existing.ReasoningEffort = reasoning;
+            if (apiKeyInput.Length > 0) existing.MaskedApiKey = MaskKey(apiKeyInput);
+            existing.UpdatedAt = DateTimeOffset.UtcNow;
+            return existing.Clone();
+        }
+    }
+
+    /// <summary>DELETE /api/model-presets/{id}：删除预设，并把引用它的会话 ModelPresetId 置空（未选择）。</summary>
+    public async Task<bool> DeleteModelPresetAsync(string id, CancellationToken ct = default)
+    {
+        await Task.Delay(20, ct);
+        lock (_lock)
+        {
+            bool removed = _modelPresets.RemoveAll(p => p.Id == id) > 0;
+            if (!removed) return false;
+
+            // §4.3：引用该预设的会话 model_preset_id 自动置 NULL（Fake 用空串表示未选择）
+            foreach (var session in _sessions.Where(s => s.ModelPresetId == id))
+            {
+                session.ModelPresetId = "";
+            }
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// POST /api/model-presets/{id}/test-connection：不抛异常——预设不存在/配置缺失返回 Ok=false，
+    /// 否则 Ok=true 模拟成功（假数据模式不发起真实上游请求）。
+    /// </summary>
+    public async Task<TestConnectionResult> TestModelPresetAsync(string id, CancellationToken ct = default)
+    {
+        await Task.Delay(150, ct); // 模拟连通性探测耗时
+        lock (_lock)
+        {
+            var preset = _modelPresets.FirstOrDefault(p => p.Id == id);
+            if (preset == null)
+            {
+                return new TestConnectionResult
+                {
+                    Ok = false,
+                    ErrorCode = "not_found",
+                    Message = "所选模型预设不存在或已被删除",
+                };
+            }
+
+            if (string.IsNullOrWhiteSpace(preset.BaseUrl) || string.IsNullOrWhiteSpace(preset.Model))
+            {
+                return new TestConnectionResult
+                {
+                    Ok = false,
+                    ErrorCode = "validation_error",
+                    Message = "请先填写 Base URL 与模型名后再测试连接（假数据模式仅做本地校验，未真实请求）",
+                };
+            }
+
+            return new TestConnectionResult
+            {
+                Ok = true,
+                Message = "连接成功（假数据模式模拟结果，未发起真实请求）",
+            };
+        }
+    }
 
     // ---------------- 流式生成 ----------------
 
@@ -496,15 +617,41 @@ public sealed class FakeBackendService : IBackendService
     {
         var now = DateTimeOffset.UtcNow;
 
+        // v0.6 全局模型预设：模型 Base URL / Key / 模型名 / 推理强度集中在预设里，
+        // 会话通过 ModelPresetId 引用（列表按 created_at 升序，故两个示例预设时间递增）。
+        var presetDeepSeek = new ModelPreset
+        {
+            Id = "preset-demo-01",
+            Name = "DeepSeek Flash（示例）",
+            BaseUrl = "https://api.deepseek.com",
+            MaskedApiKey = "sk-12****abcd",
+            Model = "deepseek-flash",
+            ReasoningEffort = "low",
+            CreatedAt = now.AddMinutes(-118),
+            UpdatedAt = now.AddMinutes(-118),
+        };
+        var presetOpenAi = new ModelPreset
+        {
+            Id = "preset-demo-02",
+            Name = "OpenAI（示例）",
+            BaseUrl = "https://api.openai.com/v1",
+            MaskedApiKey = "sk-34****ef56",
+            Model = "gpt-4o-mini",
+            ReasoningEffort = "",
+            CreatedAt = now.AddMinutes(-108),
+            UpdatedAt = now.AddMinutes(-108),
+        };
+        _modelPresets.Add(presetDeepSeek);
+        _modelPresets.Add(presetOpenAi);
+
         // 会话 A：包含世界书命中小字与一条“（已停止）”消息，启动即演示渲染效果
         var a = new SessionInfo
         {
             Id = "demo-session-01",
             Name = "示例：王城历险",
             SystemPrompt = "你是一个奇幻世界观的叙事助手，请沉浸式地推进故事。",
-            Model = "gpt-4o-mini（示例）",
-            BaseUrl = "https://api.openai.com/v1",
-            MaskedApiKey = "sk-12****abcd",
+            // v0.6：不再由会话保存模型配置，改为引用全局预设（A/B 沿用旧示例的 OpenAI 配置）
+            ModelPresetId = presetOpenAi.Id,
             CreatedAt = now.AddMinutes(-120),
             UpdatedAt = now.AddMinutes(-10),
         };
@@ -515,18 +662,17 @@ public sealed class FakeBackendService : IBackendService
             Id = "demo-session-02",
             Name = "示例：魔法学院",
             SystemPrompt = "你扮演魔法学院的教务助理。",
-            Model = "gpt-4o-mini（示例）",
-            BaseUrl = "https://api.openai.com/v1",
-            MaskedApiKey = "sk-34****ef56",
+            ModelPresetId = presetOpenAi.Id,
             CreatedAt = now.AddMinutes(-90),
             UpdatedAt = now.AddMinutes(-30),
         };
 
-        // 会话 C：空会话（演示空状态提示与新建/删除操作）
+        // 会话 C：空会话（演示空状态提示与新建/删除操作）；引用 DeepSeek 预设便于直接演示聊天
         var c = new SessionInfo
         {
             Id = "demo-session-03",
             Name = "新会话",
+            ModelPresetId = presetDeepSeek.Id,
             CreatedAt = now.AddMinutes(-60),
             UpdatedAt = now.AddMinutes(-60),
         };
@@ -622,6 +768,24 @@ public sealed class FakeBackendService : IBackendService
     /// <summary>api_key 打码（§5.1 mask_key）：保留前 4 后 4，中间 *；不足 8 位全打码。</summary>
     private static string MaskKey(string key)
         => key.Length < 8 ? new string('*', key.Length) : key[..4] + new string('*', key.Length - 8) + key[^4..];
+
+    /// <summary>预设名校验（§4.3：name 非空）：去首尾空白后为空则抛与后端校验同口径的异常。</summary>
+    private static string NormalizePresetName(ModelPreset preset)
+    {
+        var name = (preset.Name ?? "").Trim();
+        if (name.Length == 0) throw new InvalidOperationException("预设名称不能为空");
+        return name;
+    }
+
+    /// <summary>推理强度校验（§4.3）：空 = 不设置；仅允许 low / medium / high（统一存小写）。</summary>
+    private static string NormalizeReasoningEffort(string? value)
+    {
+        var reasoning = (value ?? "").Trim();
+        if (reasoning.Length == 0) return "";
+        if (!AllowedReasoningEfforts.Contains(reasoning))
+            throw new InvalidOperationException("推理强度只能为 low / medium / high，或留空表示不设置");
+        return reasoning.ToLowerInvariant();
+    }
 
     private static ChatMessage SeedMessage(
         long id, string sessionId, MessageRole role, string content, DateTimeOffset createdAt,

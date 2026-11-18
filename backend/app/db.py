@@ -12,9 +12,14 @@
   顺序增量执行；init_db 幂等（§5.1）；
 - 所有 DAO 返回 dict（sqlite3.Row → dict），不泄漏连接对象。
 
-注意：本模块的 DAO 签名按 §5.1 冻结，backend-chat 会直接调用；
-除契约表列出的 16 个函数外，另提供 `get_session_raw`（返回未打码的 api_key，
-供 backend-chat 的聊天流程读取真实 Key 使用，见其 docstring）。
+v0.6 变更（全局模型预设）：
+- sessions 不再保存 base_url / api_key / model / reasoning_effort（v3 迁移回填为
+  model_presets 预设后删除旧列），改为 `model_preset_id` 引用全局预设；
+- 新增 model_presets 表与 list/get/get_raw/create/update/delete 六个 DAO；
+- `get_session_raw` 保留（v0.6 起会话已无敏感字段，与 get_session 返回值相同，
+  仅为兼容既有内部调用）。
+
+注意：本模块的 DAO 签名按 §5.1 冻结，backend-chat 会直接调用。
 """
 
 from __future__ import annotations
@@ -84,6 +89,72 @@ CREATE TABLE worldbook_entries (
 CREATE INDEX idx_worldbook_session_sort ON worldbook_entries(session_id, sort_order);
 """
 
+# v3（v0.6②③④）：全局模型预设。
+#   1. 新建 model_presets 表（§5）；
+#   2. sessions 增加 model_preset_id（NULL = 未选择；不建外键，删除预设时由
+#      delete_model_preset 显式把引用会话置 NULL）；
+#   3. 旧数据回填：存在模型配置的会话按 (base_url, api_key, model,
+#      reasoning_effort) 去重生成预设，并把会话 model_preset_id 指向匹配预设；
+#   4. 回填完成后删除 sessions 的 base_url / api_key / model / reasoning_effort
+#      旧列（SQLite 3.35+ 的 ALTER TABLE DROP COLUMN，本机 3.53 实测可用）。
+#   5. meta 记录 presets_backfilled=1（纯 SQL 回填条件基于旧列，旧列删除后本身
+#      即幂等；标记仅作为迁移完成的显式证据，防止任何人工重复回填路径）。
+# 注意：迁移脚本自身不得包含 BEGIN/COMMIT/ROLLBACK（事务由 init_db 包裹）。
+# 时间：预设取同组会话的 MIN(created_at) / MAX(updated_at)（复用真实时间线，
+# 避免全部预设时间相同导致列表排序不稳定）；空串 reasoning_effort 归一为 NULL
+# （NULL = 不设置/不向上游发送，与 API 校验语义一致）。
+MIGRATION_V3_MODEL_PRESETS = """
+CREATE TABLE model_presets (
+    id                TEXT PRIMARY KEY,          -- UUID
+    name              TEXT NOT NULL DEFAULT '',   -- 预设名（非空由 API 层校验）
+    base_url          TEXT NOT NULL DEFAULT '',   -- 模型 Base URL
+    api_key           TEXT NOT NULL DEFAULT '',   -- 明文存储（§12），接口打码回显
+    model             TEXT NOT NULL DEFAULT '',   -- 模型名
+    reasoning_effort  TEXT,                       -- NULL = 不设置；low/medium/high
+    created_at        TEXT NOT NULL,              -- ISO8601（UTC）
+    updated_at        TEXT NOT NULL               -- ISO8601（UTC）
+);
+
+ALTER TABLE sessions ADD COLUMN model_preset_id TEXT;
+
+INSERT INTO model_presets (id, name, base_url, api_key, model, reasoning_effort, created_at, updated_at)
+SELECT
+    lower(hex(randomblob(16))),
+    COALESCE(NULLIF(COALESCE(model, ''), ''), '默认模型'),
+    COALESCE(base_url, ''),
+    COALESCE(api_key, ''),
+    COALESCE(model, ''),
+    NULLIF(COALESCE(reasoning_effort, ''), ''),
+    MIN(created_at),
+    MAX(updated_at)
+FROM sessions
+WHERE COALESCE(base_url, '') <> ''
+   OR COALESCE(model, '') <> ''
+   OR COALESCE(api_key, '') <> ''
+GROUP BY COALESCE(base_url, ''), COALESCE(api_key, ''), COALESCE(model, ''),
+         COALESCE(reasoning_effort, '');
+
+UPDATE sessions
+SET model_preset_id = (
+    SELECT p.id FROM model_presets p
+    WHERE p.base_url = COALESCE(sessions.base_url, '')
+      AND p.api_key = COALESCE(sessions.api_key, '')
+      AND p.model = COALESCE(sessions.model, '')
+      AND COALESCE(p.reasoning_effort, '') = COALESCE(sessions.reasoning_effort, '')
+)
+WHERE COALESCE(base_url, '') <> ''
+   OR COALESCE(model, '') <> ''
+   OR COALESCE(api_key, '') <> '';
+
+ALTER TABLE sessions DROP COLUMN base_url;
+ALTER TABLE sessions DROP COLUMN api_key;
+ALTER TABLE sessions DROP COLUMN model;
+ALTER TABLE sessions DROP COLUMN reasoning_effort;
+
+INSERT INTO meta(key, value) VALUES ('presets_backfilled', '1')
+ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+"""
+
 # MIGRATIONS：(版本号, SQL 脚本)；新版本只追加到列表末尾，禁止修改历史条目。
 MIGRATIONS: list[tuple[int, str]] = [
     (1, SCHEMA_V1),
@@ -91,30 +162,35 @@ MIGRATIONS: list[tuple[int, str]] = [
     # NULL = 不设置/不向上游发送该字段；取值 low/medium/high 由 API 层校验。
     # 历史 v1 库启动时由 init_db 自动增量升级，既有数据 reasoning_effort 为 NULL。
     (2, "ALTER TABLE sessions ADD COLUMN reasoning_effort TEXT;"),
+    # v3（v0.6）：全局模型预设 + 会话引用 + 旧模型配置回填后删除旧列。
+    (3, MIGRATION_V3_MODEL_PRESETS),
 ]
 
-# 会话表可被 update_session 更新的列（§4.3 PATCH 契约 + §5 表结构）。
+# 会话表可被 update_session 更新的列（§4.3 PATCH 契约 + §5 表结构，v0.6）。
+# v0.6 起 base_url / api_key / model / reasoning_effort 已从 sessions 删除，
+# 模型配置改由 model_preset_id 引用全局预设。
 _SESSION_COLUMNS = {
     "name",
     "system_prompt",
     "scan_rounds",
     "worldbook_enabled",
-    "base_url",
-    "api_key",
-    "model",
+    "model_preset_id",
     "temperature",
     "top_p",
     "max_tokens",
     "max_context_chars",
-    "reasoning_effort",
     "proxy_url",
 }
 
 # 允许显式置为 NULL（"清除配置"）的列；其余列传入 None 视为"未提供"跳过。
 # 注意：proxy_url 为 NOT NULL DEFAULT ''（§5 "可空 = 直连" 指空串，非 NULL），
 # 清除代理应 PATCH 空串，因此不在此列表。
-# reasoning_effort（v0.5①）为可空 TEXT：null = 清除配置（置 NULL，不向上游发送）。
-_SESSION_NULLABLE = {"base_url", "model", "max_tokens", "reasoning_effort"}
+# max_tokens（v0.5）：null = 清除配置（上游默认）；
+# model_preset_id（v0.6③）：null = 清除预设选择（未选择状态）。
+_SESSION_NULLABLE = {"max_tokens", "model_preset_id"}
+
+# 模型预设表可被 update_model_preset 更新的列（§4.3 PATCH /api/model-presets/{id}）。
+_MODEL_PRESET_COLUMNS = {"name", "base_url", "api_key", "model", "reasoning_effort"}
 
 # 世界书条目表可被 update_worldbook_entry 更新的列（§4.3 PATCH 契约）。
 _WORLDBOOK_COLUMNS = {"name", "keywords", "content", "enabled", "sort_order"}
@@ -246,7 +322,10 @@ def _select_session(conn: sqlite3.Connection, session_id: str) -> dict | None:
 
 
 def list_sessions() -> list[dict]:
-    """会话列表：按 updated_at 倒序，附 message_count，api_key 已打码（§5.1）。"""
+    """会话列表：按 updated_at 倒序，附 message_count（§5.1）。
+
+    v0.6 起会话表已无 api_key（模型配置走预设），无需打码。
+    """
     conn = _connect()
     try:
         rows = conn.execute(
@@ -256,31 +335,24 @@ def list_sessions() -> list[dict]:
         ).fetchall()
     finally:
         conn.close()
-    result = [_row_to_dict(r) for r in rows]
-    for item in result:
-        item["api_key"] = mask_key(item["api_key"])
-    return result
+    return [_row_to_dict(r) for r in rows]
 
 
 def get_session(session_id: str) -> dict | None:
-    """会话详情：api_key 打码（§5.1 契约，对外接口一律不暴露明文）。"""
+    """会话详情（v0.6：含 model_preset_id；会话已无敏感字段，无需打码）。"""
     conn = _connect()
     try:
         row = _select_session(conn, session_id)
     finally:
         conn.close()
-    if row is None:
-        return None
-    row["api_key"] = mask_key(row["api_key"])
     return row
 
 
 def get_session_raw(session_id: str) -> dict | None:
-    """会话详情（api_key **不**打码，原始值）。
+    """会话详情（原始值）。
 
-    这是对 §5.1 契约的补充工具函数（契约表未列出）：§5.1 冻结了
-    get_session 返回打码 Key，但 backend-chat 的聊天流程需要真实 Key
-    调用上游 API，因此提供本函数供其内部读取；HTTP 层不得直接使用。
+    v0.6 起会话表已无 api_key 等敏感字段，本函数与 get_session 返回值相同；
+    保留函数仅为兼容既有内部调用（chat 路由等），HTTP 层优先使用 get_session。
     """
     conn = _connect()
     try:
@@ -296,8 +368,8 @@ def create_session(name: str) -> dict:
     默认值（严格照抄 §5.1 / §4.3）：
         temperature 1.0、top_p 1.0、scan_rounds 4、worldbook_enabled 1、
         max_context_chars 80000、proxy_url 空、system_prompt 空；
-        base_url / model / max_tokens / reasoning_effort 为 NULL（可空，
-        上游默认；reasoning_effort 为 NULL = 不设置/不发送，v0.5①）。
+        model_preset_id / max_tokens 为 NULL（v0.6：新建会话未选择预设，
+        聊天时会提示先选择；max_tokens NULL = 上游默认）。
     """
     session_id = _new_uuid()
     now = _utcnow()
@@ -305,19 +377,17 @@ def create_session(name: str) -> dict:
     try:
         conn.execute(
             "INSERT INTO sessions ("
-            " id, name, system_prompt, scan_rounds, worldbook_enabled, base_url,"
-            " api_key, model, temperature, top_p, max_tokens, max_context_chars,"
+            " id, name, system_prompt, scan_rounds, worldbook_enabled,"
+            " model_preset_id, temperature, top_p, max_tokens, max_context_chars,"
             " proxy_url, created_at, updated_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 session_id,
                 name,
                 "",   # system_prompt 默认空
                 4,    # scan_rounds 默认 4
                 1,    # worldbook_enabled 默认 1
-                None,  # base_url 可空
-                "",   # api_key 默认空串
-                None,  # model 可空
+                None,  # model_preset_id：未选择预设
                 1.0,  # temperature 默认 1.0
                 1.0,  # top_p 默认 1.0
                 None,  # max_tokens：NULL = 上游默认
@@ -334,13 +404,13 @@ def create_session(name: str) -> dict:
 
 
 def update_session(session_id: str, fields: dict) -> dict | None:
-    """部分更新会话：仅更新传入字段；api_key 空值不更新；自动刷新 updated_at（§5.1）。
+    """部分更新会话：仅更新传入字段；自动刷新 updated_at（§5.1）。
 
-    规则：
-        - 未知键忽略（白名单 _SESSION_COLUMNS）；
-        - api_key 传 None / 空串 → 跳过（§4.3：仅非空值更新）；
+    规则（v0.6）：
+        - 未知键忽略（白名单 _SESSION_COLUMNS；v0.6 起 base_url / api_key /
+          model / reasoning_effort 已不在白名单，传入被忽略）；
         - 显式 null 一律视为"未提供 → 不更新"，唯一例外是 _SESSION_NULLABLE
-          （base_url / model / max_tokens）用 null 表示"清除配置"置 NULL；
+          （max_tokens 用 null 清除配置；model_preset_id 用 null 清除预设选择）；
         - proxy_url 为 NOT NULL 列，传 None 视为"未提供"（清除代理用空串）；
         - worldbook_enabled 统一存 0/1；显式 false 正常写入 0。
     """
@@ -361,13 +431,7 @@ def update_session(session_id: str, fields: dict) -> dict | None:
             if column in _SESSION_NULLABLE:
                 sets.append(f"{column} = NULL")
             continue
-        if column == "api_key":
-            # api_key 仅在传入非空值时更新（§4.3 PATCH 语义）
-            if str(value).strip() == "":
-                continue
-            sets.append("api_key = ?")
-            params.append(str(value))
-        elif column == "worldbook_enabled":
+        if column == "worldbook_enabled":
             # 0/1 整型存储（表结构 §5）；显式 false 正常写入 0
             sets.append("worldbook_enabled = ?")
             params.append(1 if value else 0)
@@ -405,6 +469,165 @@ def delete_session(session_id: str) -> bool:
         cur = conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
         conn.commit()
         return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 模型预设 DAO（v0.6，§5.1）
+# ---------------------------------------------------------------------------
+
+def _select_model_preset(conn: sqlite3.Connection, preset_id: str) -> dict | None:
+    """按 id 查询模型预设（内部工具，不做打码处理）。"""
+    row = conn.execute(
+        "SELECT * FROM model_presets WHERE id = ?", (preset_id,)
+    ).fetchone()
+    return _row_to_dict(row) if row is not None else None
+
+
+def _mask_preset(preset: dict) -> dict:
+    """模型预设打码：api_key 保留前 4 后 4（§5.1 mask_key）。"""
+    preset["api_key"] = mask_key(preset.get("api_key"))
+    return preset
+
+
+def list_model_presets() -> list[dict]:
+    """模型预设列表：按 created_at 升序，api_key 打码（§5.1，v0.6）。"""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM model_presets ORDER BY created_at ASC"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [_mask_preset(_row_to_dict(r)) for r in rows]
+
+
+def get_model_preset(preset_id: str) -> dict | None:
+    """模型预设详情：api_key 打码（§5.1，对外接口用）。"""
+    conn = _connect()
+    try:
+        preset = _select_model_preset(conn, preset_id)
+    finally:
+        conn.close()
+    return _mask_preset(preset) if preset is not None else None
+
+
+def get_model_preset_raw(preset_id: str) -> dict | None:
+    """模型预设详情（api_key **不**打码，仅 chat / test-connection 内部使用，§5.1）。"""
+    conn = _connect()
+    try:
+        return _select_model_preset(conn, preset_id)
+    finally:
+        conn.close()
+
+
+def create_model_preset(data: dict) -> dict:
+    """新建模型预设，返回原始 dict（api_key 未打码；HTTP 层负责打码回显）。
+
+    data 字段（§5.1 / §4.3）：name / base_url / api_key / model /
+    reasoning_effort。name 非空与 reasoning_effort 取值校验由 Pydantic 层负责；
+    空串 reasoning_effort 归一为 NULL（NULL = 不设置/不向上游发送）。
+    """
+    preset_id = _new_uuid()
+    now = _utcnow()
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT INTO model_presets ("
+            " id, name, base_url, api_key, model, reasoning_effort, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                preset_id,
+                data.get("name") or "",
+                data.get("base_url") or "",
+                data.get("api_key") or "",
+                data.get("model") or "",
+                data.get("reasoning_effort") or None,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        return _select_model_preset(conn, preset_id) or {}
+    finally:
+        conn.close()
+
+
+def update_model_preset(preset_id: str, fields: dict) -> dict | None:
+    """部分更新模型预设：仅更新传入字段，自动刷新 updated_at（§5.1，v0.6）。
+
+    规则：
+        - 未知键忽略（白名单 _MODEL_PRESET_COLUMNS）；
+        - api_key 传 None / 空串 → 跳过（§4.3：仅非空值更新，避免打码回显被当明文写回）；
+        - 其余字段传 None 视为"未提供 → 不更新"；唯一例外 reasoning_effort
+          传 null = 清除（置 NULL，不向上游发送）；
+        - 不存在返回 None。
+    """
+    if not fields:
+        return get_model_preset_raw(preset_id)
+
+    sets: list[str] = []
+    params: list[object] = []
+    for column in _MODEL_PRESET_COLUMNS:
+        if column not in fields:
+            continue
+        value = fields[column]
+        if column == "api_key":
+            # api_key 仅在传入非空值时更新（§4.3 契约）
+            if value is None or str(value).strip() == "":
+                continue
+            sets.append("api_key = ?")
+            params.append(str(value))
+        elif column == "reasoning_effort":
+            if value is None or str(value).strip() == "":
+                sets.append("reasoning_effort = NULL")  # null = 清除
+            else:
+                sets.append("reasoning_effort = ?")
+                params.append(value)
+        else:
+            if value is None:
+                continue
+            sets.append(f"{column} = ?")
+            params.append(value)
+
+    if not sets:
+        return get_model_preset_raw(preset_id)
+
+    sets.append("updated_at = ?")
+    params.append(_utcnow())
+    params.append(preset_id)  # WHERE id = ?
+
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            f"UPDATE model_presets SET {', '.join(sets)} WHERE id = ?", tuple(params)
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            return None
+        return _select_model_preset(conn, preset_id)
+    finally:
+        conn.close()
+
+
+def delete_model_preset(preset_id: str) -> bool:
+    """删除模型预设，并把引用它的会话 model_preset_id 置 NULL（§5.1，v0.6）。
+
+    返回是否真的删除了预设（不存在返回 False）。两步写操作在同一事务内，
+    避免"预设已删、会话仍引用悬空 id"的中间态。
+    """
+    conn = _connect()
+    try:
+        cur = conn.execute("DELETE FROM model_presets WHERE id = ?", (preset_id,))
+        if cur.rowcount == 0:
+            return False
+        conn.execute(
+            "UPDATE sessions SET model_preset_id = NULL WHERE model_preset_id = ?",
+            (preset_id,),
+        )
+        conn.commit()
+        return True
     finally:
         conn.close()
 

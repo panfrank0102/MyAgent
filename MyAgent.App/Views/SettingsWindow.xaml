@@ -41,7 +41,7 @@
     <Border Grid.Row="0" BorderBrush="#E5E7EB" BorderThickness="0,0,0,1">
       <StackPanel Margin="18,12">
         <TextBlock Text="会话设置" FontSize="17" FontWeight="Bold"/>
-        <TextBlock Text="配置仅作用于当前会话（每会话独立）；保存时整表提交，API Key 未改动则不更新。"
+        <TextBlock Text="配置仅作用于当前会话（每会话独立）；模型 Base URL / API Key 等全局参数在“全局设置 → 模型预设”中管理。"
                    FontSize="11" Foreground="#6B7280" Margin="0,3,0,0" TextWrapping="Wrap"/>
       </StackPanel>
     </Border>
@@ -85,34 +85,22 @@
                     ToolTip="关闭后本会话不注入世界书；仍可从下方“世界书编辑”进入编辑条目"/>
         </Grid>
 
-        <!-- Base URL -->
-        <TextBlock Text="Base URL" Style="{StaticResource FieldLabel}" Margin="0,12,0,3"/>
-        <TextBox Text="{Binding BaseUrl, UpdateSourceTrigger=PropertyChanged}" Style="{StaticResource FieldBox}"/>
-        <TextBlock Text="OpenAI 兼容接口地址，如 https://api.openai.com/v1；留空 = 清除配置。" Style="{StaticResource HintText}"/>
-
-        <!-- API Key（密码框，回显打码值） -->
-        <TextBlock Text="API Key" Style="{StaticResource FieldLabel}" Margin="0,12,0,3"/>
-        <PasswordBox x:Name="ApiKeyBox" Padding="6,4" FontSize="13" PasswordChanged="ApiKeyBox_PasswordChanged"
-                     ToolTip="打开时回显打码值；不修改则保存时不更新 Key"/>
-        <TextBlock Text="回显为打码值；未修改或留空 = 不更新 API Key（服务端仅保存非空值）。"
-                   Style="{StaticResource HintText}"/>
-
-        <!-- 模型名 -->
-        <TextBlock Text="模型名" Style="{StaticResource FieldLabel}" Margin="0,12,0,3"/>
-        <TextBox Text="{Binding Model, UpdateSourceTrigger=PropertyChanged}" Style="{StaticResource FieldBox}"/>
-        <TextBlock Text="例如 gpt-4o-mini；留空 = 清除配置。" Style="{StaticResource HintText}"/>
-
-        <!-- 推理强度（v0.5①）：空值 = 不设置 → 不向上游发送 reasoning_effort 参数 -->
-        <TextBlock Text="推理强度" Style="{StaticResource FieldLabel}" Margin="0,12,0,3"/>
-        <ComboBox x:Name="ReasoningEffortBox" Width="160" HorizontalAlignment="Left"
-                  FontSize="13" Padding="6,4" SelectedValuePath="Tag"
-                  SelectedValue="{Binding ReasoningEffortSelected, Mode=TwoWay}">
-          <ComboBoxItem Content="不设置" Tag=""/>
-          <ComboBoxItem Content="低" Tag="low"/>
-          <ComboBoxItem Content="中" Tag="medium"/>
-          <ComboBoxItem Content="高" Tag="high"/>
-        </ComboBox>
-        <TextBlock Text="部分模型不支持该参数：不设置即不向上游发送。" Style="{StaticResource HintText}"/>
+        <!-- 模型预设（v0.6）：Base URL / API Key / 模型名 / 推理强度统一在“全局设置 → 模型预设”管理，
+             会话只做选择；未选择时聊天会提示先选择预设（保存仍允许）。 -->
+        <TextBlock Text="模型预设" Style="{StaticResource FieldLabel}" Margin="0,12,0,3"/>
+        <Grid>
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="Auto"/>
+          </Grid.ColumnDefinitions>
+          <ComboBox x:Name="ModelPresetBox" ItemsSource="{Binding ModelPresetOptions}"
+                    SelectedItem="{Binding SelectedModelPreset, Mode=TwoWay}"
+                    DisplayMemberPath="Name" FontSize="13" Padding="6,4"/>
+          <Button Grid.Column="1" Content="管理模型预设…" Click="ManageModelPresets_Click"
+                  Margin="8,0,0,0" Padding="10,4" VerticalAlignment="Center"
+                  ToolTip="打开全局设置 → 模型预设（新建/编辑/删除/测试连接）；关闭后自动刷新本下拉"/>
+        </Grid>
+        <TextBlock Text="{Binding ModelPresetHint}" Style="{StaticResource HintText}"/>
 
         <!-- 采样参数 -->
         <Grid Margin="0,12,0,0">
@@ -156,26 +144,6 @@
         <TextBlock Text="proxy_url" Style="{StaticResource FieldLabel}" Margin="0,12,0,3"/>
         <TextBox Text="{Binding ProxyUrl, UpdateSourceTrigger=PropertyChanged}" Style="{StaticResource FieldBox}"/>
         <TextBlock Text="留空 = 直连；仅支持 http:// 或 https://，如 http://127.0.0.1:7890。" Style="{StaticResource HintText}"/>
-
-        <!-- 测试连接 -->
-        <StackPanel Orientation="Horizontal" Margin="0,16,0,0">
-          <Button Content="测试连接" Command="{Binding TestConnectionCommand}" Padding="14,5" VerticalAlignment="Center"/>
-          <TextBlock Text="{Binding TestResultText}" VerticalAlignment="Center" Margin="12,0,0,0"
-                     TextWrapping="Wrap" MaxWidth="420">
-            <TextBlock.Style>
-              <Style TargetType="TextBlock">
-                <Setter Property="Foreground" Value="#B91C1C"/>
-                <Style.Triggers>
-                  <DataTrigger Binding="{Binding TestResultOk}" Value="True">
-                    <Setter Property="Foreground" Value="#047857"/>
-                  </DataTrigger>
-                </Style.Triggers>
-              </Style>
-            </TextBlock.Style>
-          </TextBlock>
-        </StackPanel>
-        <TextBlock Text="测试使用当前表单值；API Key 未修改时以空 Key 探测（本地模型/直连可用，需验证鉴权请重新输入完整 Key）。"
-                   Style="{StaticResource HintText}"/>
       </StackPanel>
     </ScrollViewer>
 

@@ -2,8 +2,9 @@ namespace MyAgent.App.Models;
 
 /// <summary>
 /// 会话信息（对应《需求与方案指导.md》§5 sessions 表 + §4.3 GET /api/sessions 返回形状）。
-/// api_key 在列表/详情接口中一律以打码形式返回（MaskedApiKey，保留前 4 后 4），仅 PATCH 时可写入明文。
-/// 假数据阶段由 FakeBackendService 填充；集成阶段由 ApiClient 解析后端 JSON 得到同一模型。
+/// v0.6：会话不再持有模型配置（Base URL / API Key / 模型名 / 推理强度），
+/// 改为通过 <see cref="ModelPresetId"/> 引用全局模型预设（见 ModelPreset）。
+/// 假数据阶段由 FakeBackendService 填充；真实模式由 RealApiBackendService 解析后端 JSON 得到同一模型。
 /// </summary>
 public class SessionInfo
 {
@@ -22,15 +23,6 @@ public class SessionInfo
     /// <summary>世界书开关（默认开启）。</summary>
     public bool WorldbookEnabled { get; set; } = true;
 
-    /// <summary>模型 Base URL（v0.6 废弃：会话不再持有模型配置，改用 <see cref="ModelPresetId"/>；保留仅为兼容旧代码，后端不再返回该字段）。</summary>
-    public string BaseUrl { get; set; } = "";
-
-    /// <summary>打码后的 API Key（v0.6 废弃：会话不再持有 API Key；后端不再返回该字段）。</summary>
-    public string MaskedApiKey { get; set; } = "";
-
-    /// <summary>模型名（v0.6 废弃：改用模型预设；后端不再返回该字段）。</summary>
-    public string Model { get; set; } = "";
-
     /// <summary>采样温度，默认 1.0。</summary>
     public double Temperature { get; set; } = 1.0;
 
@@ -39,9 +31,6 @@ public class SessionInfo
 
     /// <summary>max_tokens，null = 上游默认。</summary>
     public int? MaxTokens { get; set; }
-
-    /// <summary>推理强度（v0.5① 起为会话字段；v0.6 废弃：改用模型预设；后端不再返回该字段）。</summary>
-    public string ReasoningEffort { get; set; } = "";
 
     /// <summary>所选全局模型预设 id（v0.6）：空串 = 未选择；聊天需先选择预设。</summary>
     public string ModelPresetId { get; set; } = "";
@@ -69,13 +58,9 @@ public class SessionInfo
         SystemPrompt = SystemPrompt,
         ScanRounds = ScanRounds,
         WorldbookEnabled = WorldbookEnabled,
-        BaseUrl = BaseUrl,
-        MaskedApiKey = MaskedApiKey,
-        Model = Model,
         Temperature = Temperature,
         TopP = TopP,
         MaxTokens = MaxTokens,
-        ReasoningEffort = ReasoningEffort,
         ModelPresetId = ModelPresetId,
         MaxContextChars = MaxContextChars,
         ProxyUrl = ProxyUrl,

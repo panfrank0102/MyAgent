@@ -267,10 +267,14 @@
       <Border Grid.Row="0" BorderBrush="#E5E7EB" BorderThickness="0,0,0,1" Background="White">
         <DockPanel Margin="16,11">
           <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+            <!-- v0.6 入口：全局设置（模型预设等全局参数），无需选中会话 -->
+            <Button Content="全局设置" Click="OpenGlobalSettings_Click"
+                    Padding="10,4" Margin="0,0,12,0" VerticalAlignment="Center"
+                    ToolTip="全局设置：管理模型预设（Base URL / API Key / 模型名 / 推理强度），供所有会话选择"/>
             <!-- Step 12 入口：作用于当前选中会话；无选中时禁用（HasSession） -->
             <Button Content="会话设置" Click="OpenSettings_Click" IsEnabled="{Binding HasSession}"
                     Padding="10,4" Margin="0,0,12,0" VerticalAlignment="Center"
-                    ToolTip="编辑当前会话的系统提示词、模型参数、预算与代理；无选中会话时不可用"/>
+                    ToolTip="编辑当前会话的系统提示词、模型预设、预算与代理；无选中会话时不可用"/>
             <TextBlock Text="生成中…" Foreground="#2563EB" FontSize="12"
                        Visibility="{Binding SelectedSession.IsGenerating, Converter={StaticResource BoolToVis}, FallbackValue=Collapsed}"/>
             <TextBlock Text="{Binding SelectedSession.CountDisplay}" FontSize="12" Foreground="#6B7280" Margin="12,0,0,0"/>

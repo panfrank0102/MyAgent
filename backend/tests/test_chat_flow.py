@@ -1,18 +1,17 @@
 """Step 8 测试：chat/regenerate 流式端点全流程（mock 上游）。
 
 策略：
-- 数据库：优先使用 backend-core 的真实 app/db.py（tmp_path 临时库）；
-  若 db.py 尚未就绪（并行开发中），注入一个最小内存替身（下方
-  _make_standin_db，函数签名与 §5.1 契约一致，仅供本测试驱动 chat 链路）。
+- 数据库：使用真实 app/db.py（tmp 临时库，v0.6 迁移后表结构）。
 - 上游：monkeypatch app.services.provider.stream_chat 为假生成器（mock 上游）。
-- 应用：只挂 chat + config 两个路由，避免依赖 backend-core 尚未完成的其它路由。
+- 应用：只挂 chat + config 两个路由，避免依赖其它路由的装配细节。
 
 覆盖（《开发步骤分解.md》Step 8 完成标准 + 任务要求）：
 meta→delta→done 序列、meta 必发且未命中为空数组、世界书命中 meta、
-reasoning_effort 透传（v0.5①）、error 映射（失败不落库 AI 回复）、
-regenerate 两分支、regenerate 缺少 user 输入时
-不删除消息（先删后判缺陷回归）、409 并发、
-客户端断开/框架取消 → interrupted=1 落库、test-connection、404/400。
+v0.6 模型预设解析（未选择/预设被删 → meta→error；选择预设 → provider 收到
+预设的 base_url/api_key/model/reasoning_effort 与会话的采样/代理参数）、
+error 映射（失败不落库 AI 回复）、regenerate 两分支、regenerate 缺少 user
+输入时不删除消息（先删后判缺陷回归）、409 并发、客户端断开/框架取消 →
+interrupted=1 落库、test-connection、404/400。
 """
 
 from __future__ import annotations
@@ -21,10 +20,9 @@ import asyncio
 import json
 import os
 import shutil
+import sqlite3
 import sys
-import types
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -34,109 +32,10 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-# ---------------------------------------------------------------------------
-# 临时内存替身：backend-core 的 app/db.py 未就绪时的最小实现。
-# 仅实现 chat 链路用到的函数（§5.1 冻结签名）；一旦真实 db.py 出现即自动弃用。
-# ---------------------------------------------------------------------------
+# 保证在任意目录下运行 pytest 都能导入 backend/ 下的 app 包
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-
-def _make_standin_db() -> types.ModuleType:
-    """构建 app.db 的最小内存替身（临时，正式 db.py 就绪后不再使用）。"""
-    mod = types.ModuleType("app.db")
-    state: dict[str, Any] = {"sessions": {}, "messages": {}, "worldbook": {}, "seq": 0}
-
-    def _now() -> str:
-        return datetime.now(timezone.utc).isoformat()
-
-    def init_db(path=None) -> None:  # noqa: ANN001 —— 内存实现，忽略路径
-        return None
-
-    def create_session(name: str) -> dict:
-        state["seq"] += 1
-        sid = f"sid-{state['seq']}"
-        row = {"id": sid, "name": name, "system_prompt": "", "scan_rounds": 4,
-               "worldbook_enabled": 1, "base_url": None, "api_key": "",
-               "model": None, "temperature": 1.0, "top_p": 1.0, "max_tokens": None,
-               "max_context_chars": 80000, "proxy_url": "",
-               "created_at": _now(), "updated_at": _now()}
-        state["sessions"][sid] = row
-        state["messages"][sid] = []
-        state["worldbook"][sid] = []
-        return dict(row)
-
-    def update_session(session_id: str, fields: dict) -> dict | None:
-        row = state["sessions"].get(session_id)
-        if row is None:
-            return None
-        for k, v in (fields or {}).items():
-            if k == "api_key" and not v:
-                continue  # 契约：api_key 空值不更新
-            row[k] = v
-        row["updated_at"] = _now()
-        return dict(row)
-
-    def get_session_raw(session_id: str) -> dict | None:
-        """返回含原始 api_key 的会话（聊天链路专用，backend-core 已确认提供）。"""
-        row = state["sessions"].get(session_id)
-        return dict(row) if row else None
-
-    def append_message(session_id: str, role: str, content: str, interrupted: int = 0) -> dict:
-        state["seq"] += 1
-        msg = {"id": state["seq"], "session_id": session_id, "role": role,
-               "content": content, "interrupted": interrupted, "created_at": _now()}
-        state["messages"].setdefault(session_id, []).append(msg)
-        s = state["sessions"].get(session_id)
-        if s:
-            s["updated_at"] = _now()  # 契约：同步更新会话 updated_at
-        return dict(msg)
-
-    def list_messages(session_id: str, limit: int = 200) -> list[dict]:
-        msgs = state["messages"].get(session_id, [])
-        return [dict(m) for m in msgs[-limit:]]  # 最新 limit 条，id 正序
-
-    def delete_message_and_after(session_id: str, message_id: int) -> int:
-        msgs = state["messages"].get(session_id, [])
-        before = len(msgs)
-        state["messages"][session_id] = [m for m in msgs if m["id"] < message_id]
-        return before - len(state["messages"][session_id])
-
-    def list_worldbook(session_id: str) -> list[dict]:
-        rows = state["worldbook"].get(session_id, [])
-        return sorted((dict(r) for r in rows), key=lambda r: r["sort_order"])
-
-    def create_worldbook_entry(session_id: str, data: dict) -> dict:
-        state["seq"] += 1
-        default_order = max((e["sort_order"] for e in state["worldbook"].get(session_id, [])),
-                            default=0) + 1
-        entry = {"id": f"wb-{state['seq']}", "session_id": session_id,
-                 "name": data.get("name", ""), "keywords": data.get("keywords", ""),
-                 "content": data.get("content", ""), "enabled": data.get("enabled", 1),
-                 "sort_order": data.get("sort_order", default_order)}
-        state["worldbook"].setdefault(session_id, []).append(entry)
-        return dict(entry)
-
-    mod.init_db = init_db
-    mod.create_session = create_session
-    mod.update_session = update_session
-    mod.get_session_raw = get_session_raw
-    mod.append_message = append_message
-    mod.list_messages = list_messages
-    mod.delete_message_and_after = delete_message_and_after
-    mod.list_worldbook = list_worldbook
-    mod.create_worldbook_entry = create_worldbook_entry
-    return mod
-
-
-# 先尝试真实 db.py；不存在则注入内存替身（必须在导入 chat 路由之前完成）。
-try:
-    from app import db as _db_mod  # backend-core 的真实实现
-except ImportError:
-    _db_mod = _make_standin_db()
-    sys.modules["app.db"] = _db_mod
-    import app as _app_pkg
-    _app_pkg.db = _db_mod
-
-db = _db_mod
+from app import db  # noqa: E402
 
 from app.routers import chat as chat_mod          # noqa: E402
 from app.routers import config as config_mod      # noqa: E402
@@ -206,13 +105,23 @@ def env() -> SimpleNamespace:
     try:
         db.init_db(Path(tmpdir) / "chat.db")
         session = db.create_session("测试会话")
-        db.update_session(session["id"], {
+        # v0.6：模型配置集中在全局预设，会话通过 model_preset_id 引用（api_key 取预设明文）。
+        preset = db.create_model_preset({
+            "name": "测试预设",
             "base_url": "https://upstream.example.com/v1",
             "api_key": "sk-test-key",
             "model": "gpt-test",
+            "reasoning_effort": None,  # 默认不设置；需要时由测试显式更新
+        })
+        db.update_session(session["id"], {
+            "model_preset_id": preset["id"],
             "system_prompt": "你是助手",
         })
-        yield SimpleNamespace(session=db.get_session_raw(session["id"]), app=_build_app())
+        yield SimpleNamespace(
+            session=db.get_session_raw(session["id"]),
+            preset=db.get_model_preset_raw(preset["id"]),
+            app=_build_app(),
+        )
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -263,20 +172,34 @@ def test_chat_done_usage_null_when_absent(env, monkeypatch) -> None:
     assert events[-1]["usage"] is None
 
 
-def test_chat_passes_reasoning_effort_to_provider(env, monkeypatch) -> None:
-    """v0.5①：会话 reasoning_effort 非空时透传给 provider.stream_chat。"""
-    db.update_session(env.session["id"], {"reasoning_effort": "high"})
+def test_chat_passes_preset_config_to_provider(env, monkeypatch) -> None:
+    """v0.6③：选择预设 → provider 收到预设的 base_url/api_key/model/reasoning_effort，
+    以及会话的 proxy_url/temperature/top_p/max_tokens（§6.1 第 7 点）。"""
+    db.update_model_preset(env.preset["id"], {"reasoning_effort": "high"})
+    db.update_session(env.session["id"], {
+        "temperature": 0.7, "top_p": 0.8, "max_tokens": 321,
+        "proxy_url": "http://proxy.example:7890",
+    })
     capture: dict = {}
     monkeypatch.setattr(provider_mod, "stream_chat", make_fake_stream(["好"], capture=capture))
     resp = TestClient(env.app).post(f"/api/sessions/{env.session['id']}/chat",
                                     json={"content": "你好"})
     assert _events(resp)[-1]["type"] == "done"
+    # 预设字段透传（api_key 为预设明文，非会话字段）
+    assert capture["base_url"] == "https://upstream.example.com/v1"
+    assert capture["api_key"] == "sk-test-key"
+    assert capture["model"] == "gpt-test"
     assert capture["reasoning_effort"] == "high"
+    # 会话字段透传（v0.6：仍保留每会话采样/代理参数）
+    assert capture["temperature"] == 0.7
+    assert capture["top_p"] == 0.8
+    assert capture["max_tokens"] == 321
+    assert capture["proxy_url"] == "http://proxy.example:7890"
 
 
-def test_chat_reasoning_effort_defaults_to_none(env, monkeypatch) -> None:
-    """v0.5①：未设置（NULL）时向 provider 传 None（不向上游发送该字段）。"""
-    assert db.get_session_raw(env.session["id"])["reasoning_effort"] is None
+def test_chat_preset_reasoning_effort_defaults_to_none(env, monkeypatch) -> None:
+    """v0.6：预设 reasoning_effort 为 NULL 时向 provider 传 None（不向上游发送该字段）。"""
+    assert env.preset["reasoning_effort"] is None
     capture: dict = {}
     monkeypatch.setattr(provider_mod, "stream_chat", make_fake_stream(["好"], capture=capture))
     resp = TestClient(env.app).post(f"/api/sessions/{env.session['id']}/chat",
@@ -285,9 +208,17 @@ def test_chat_reasoning_effort_defaults_to_none(env, monkeypatch) -> None:
     assert capture["reasoning_effort"] is None
 
 
-def test_chat_blank_reasoning_effort_normalized_to_none(env, monkeypatch) -> None:
-    """v0.5①：历史脏数据中的空串也归一为 None（不向上游发送该字段）。"""
-    db.update_session(env.session["id"], {"reasoning_effort": ""})  # 绕开 API 校验模拟脏数据
+def test_chat_preset_blank_reasoning_effort_normalized_to_none(env, monkeypatch) -> None:
+    """v0.6：预设脏数据中的空串 reasoning_effort 也归一为 None（不向上游发送该字段）。"""
+    conn = sqlite3.connect(str(db._db_path))  # 绕开 API/DAO 校验模拟历史脏数据
+    try:
+        conn.execute(
+            "UPDATE model_presets SET reasoning_effort = '' WHERE id = ?",
+            (env.preset["id"],),
+        )
+        conn.commit()
+    finally:
+        conn.close()
     capture: dict = {}
     monkeypatch.setattr(provider_mod, "stream_chat", make_fake_stream(["好"], capture=capture))
     resp = TestClient(env.app).post(f"/api/sessions/{env.session['id']}/chat",
@@ -451,16 +382,60 @@ def test_chat_upstream_error_event(env, monkeypatch) -> None:
     assert msgs[0]["content"] == "你好"           # 用户消息不丢（§6.1 第 2 点）
 
 
-def test_chat_missing_model_config_error_event(env, monkeypatch) -> None:
-    """未配置 base_url/model → error(internal) 中文提示。"""
-    db.update_session(env.session["id"], {"base_url": ""})
+def test_chat_no_preset_selected_meta_then_error(env, monkeypatch) -> None:
+    """v0.6③：会话未选择预设 → meta 必发，随后 error(internal) 中文提示；不调上游。"""
+    db.update_session(env.session["id"], {"model_preset_id": None})
+
+    calls: list[tuple] = []
+
+    async def fake_stream(*args: Any, **kwargs: Any):
+        calls.append(args)          # 不应被调用
+        yield "不该生成"             # pragma: no cover
+
+    monkeypatch.setattr(provider_mod, "stream_chat", fake_stream)
+    resp = TestClient(env.app).post(f"/api/sessions/{env.session['id']}/chat",
+                                    json={"content": "你好"})
+    assert resp.status_code == 200
+    events = _events(resp)
+    assert [e["type"] for e in events] == ["meta", "error"]  # meta 必发且最先
+    assert events[-1]["code"] == "internal"
+    assert "未选择模型预设" in events[-1]["message"]
+    assert calls == []  # 未调用上游
+    # 失败不落库 AI 回复；用户消息保留（§6.1 第 2/10 点）
+    assert [m["role"] for m in db.list_messages(env.session["id"])] == ["user"]
+    assert env.session["id"] not in chat_mod._in_flight  # 生成权已释放
+
+
+def test_chat_deleted_preset_meta_then_error(env, monkeypatch) -> None:
+    """v0.6③：会话引用的预设不存在（被并发删除）→ meta 必发 + error 中文提示。
+
+    正常删除预设会把引用会话置 NULL（走"未选择"分支）；这里直接删表模拟
+    悬空引用，覆盖"预设不存在或已被删除"这一 error 分支。
+    """
+    conn = sqlite3.connect(str(db._db_path))
+    try:
+        conn.execute("DELETE FROM model_presets WHERE id = ?", (env.preset["id"],))
+        conn.commit()
+    finally:
+        conn.close()
+    assert db.get_session_raw(env.session["id"])["model_preset_id"] == env.preset["id"]
+
+    calls: list[tuple] = []
+
+    async def fake_stream(*args: Any, **kwargs: Any):
+        calls.append(args)          # 不应被调用
+        yield "不该生成"             # pragma: no cover
+
+    monkeypatch.setattr(provider_mod, "stream_chat", fake_stream)
     resp = TestClient(env.app).post(f"/api/sessions/{env.session['id']}/chat",
                                     json={"content": "你好"})
     events = _events(resp)
     assert events[0]["type"] == "meta"
     assert events[-1]["type"] == "error"
     assert events[-1]["code"] == "internal"
-    assert "Base URL" in events[-1]["message"]
+    assert "不存在或已被删除" in events[-1]["message"]
+    assert calls == []
+    assert [m["role"] for m in db.list_messages(env.session["id"])] == ["user"]
 
 
 @pytest.mark.parametrize("code", ["rate_limited", "timeout", "upstream_unreachable", "internal"])

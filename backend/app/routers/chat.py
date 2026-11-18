@@ -10,7 +10,9 @@
   4. 组装 system（系统提示词 + 世界书块，§6.2）；
   5. 预算裁剪（§6.3，动态预留 system 与当前输入，max_context_chars=0 跳过）；
   6. 组装上游 messages（system 最前、历史居中、用户消息最后）；
-  7. 调上游流式接口逐段转发 delta，结束发 done（usage 可空）；
+  7. 解析会话所选模型预设（v0.6③）：未选择 / 预设不存在 → error；否则用预设的
+     base_url/api_key/model/reasoning_effort + 会话的 proxy_url/temperature/
+     top_p/max_tokens 调上游流式接口逐段转发 delta，结束发 done（usage 可空）；
   8. 存库 assistant 完整回复；
   9. 客户端断开（停止生成）→ 中止上游，已生成部分存库 interrupted=1；
   10. 异常映射：401/403→auth_failed、429→rate_limited、超时→timeout、
@@ -22,7 +24,9 @@ NDJSON 事件（§4.2）：每行 json.dumps(obj, ensure_ascii=False) + "\\n"；
 设计说明（歧义解释，均已在代码内标注）：
 - "轮"（user+assistant 成对）近似为"最近 2×scan_rounds 条历史消息"；
 - 4xx 的具体 code 值契约未冻结，本文件采用 not_found/bad_request/generation_in_progress；
-- 中断时若已生成文本为空则不落空 assistant 消息（无意义的空气泡）。
+- 中断时若已生成文本为空则不落空 assistant 消息（无意义的空气泡）；
+- v0.6：会话不再持有模型配置，聊天链路经 db.get_model_preset_raw 读取所选预设
+  （api_key 原始值仅在此内部使用，不下发前端）。
 """
 
 from __future__ import annotations
@@ -39,8 +43,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
-# db 为冻结 DAO 契约（§5.1，backend-core 实现）。get_session 打码回显，
-# 聊天链路必须用 get_session_raw 拿真实 api_key（backend-core 已确认提供）。
+# db 为冻结 DAO 契约（§5.1，backend-core 实现）。v0.6 起会话已无敏感字段，
+# get_session_raw 与 get_session 等价（保留为内部调用兼容）；模型配置经
+# get_model_preset_raw 读取预设明文 api_key（仅内部使用）。
 from app import db
 from app.services import context, prompt_builder, provider, worldbook
 
@@ -165,31 +170,52 @@ async def _stream_events(
     full_text = ""
     stored = False  # 是否已落库 assistant 消息（含中断部分）
 
-    # 上游配置（§6.1 第 7 点）。api_key 用原始值（get_session_raw，见 backend-core 说明）。
-    base_url = (session.get("base_url") or "").strip()
-    model = (session.get("model") or "").strip()
-    api_key = session.get("api_key") or ""
+    # 会话级参数（§6.1 第 7 点，v0.6）：代理与采样参数仍取自会话；
+    # base_url / api_key / model / reasoning_effort 改为取会话所选全局模型预设。
     proxy_url = (session.get("proxy_url") or "").strip() or None
     temperature = session.get("temperature", 1.0)
     top_p = session.get("top_p", 1.0)
     max_tokens = session.get("max_tokens")  # None = 上游默认（§5 sessions 表）
-    # v0.5①：推理强度为 NULL/空 = 不设置，此时不向上游发送该字段（部分模型不支持）。
-    reasoning_effort = (session.get("reasoning_effort") or "") or None
+    preset_id = (session.get("model_preset_id") or "").strip()
     usage_holder: dict[str, Any] = {"usage": None}
 
     try:
         # meta 事件必发且为首行（§4.2），未命中时 matched_entries 为空数组；
-        # 即使后续因配置缺失/上游失败而发 error，meta 也必须先出现。
+        # 即使后续因未选择预设/预设失效/上游失败而发 error，meta 也必须先出现。
         yield _ndjson({
             "type": "meta",
             "turn_id": str(uuid.uuid4()),
             "matched_entries": _matched_meta(matched),
         })
 
-        # 会话未配置模型接口：error 事件（契约未为此定义专属 code，归 internal）。
+        # v0.6③：会话未选择模型预设 → error（本地配置缺失，归 internal）。
+        if not preset_id:
+            yield _ndjson({"type": "error", "code": provider.CODE_INTERNAL,
+                           "message": "会话未选择模型预设，请先在会话设置中选择"
+                                      "（可在全局设置→模型预设中管理）"})
+            return
+
+        # 预设不存在（已被删除）→ error；删除预设时引用会话会被置 NULL，
+        # 但这里仍做防御校验，覆盖并发删除等边角场景。
+        preset = db.get_model_preset_raw(preset_id)
+        if preset is None:
+            yield _ndjson({"type": "error", "code": provider.CODE_INTERNAL,
+                           "message": "所选模型预设不存在或已被删除，请重新选择"})
+            return
+
+        base_url = (preset.get("base_url") or "").strip()
+        model = (preset.get("model") or "").strip()
+        api_key = preset.get("api_key") or ""
+        # v0.6：推理强度为预设字段；NULL/空 = 不设置，此时不向上游发送该字段
+        # （部分模型不支持该参数）。
+        reasoning_effort = (preset.get("reasoning_effort") or "") or None
+
+        # 防御：预设存在但 Base URL / 模型名为空（用户尚未填完）→ 明确中文报错，
+        # 避免拿空地址请求上游后报难以理解的 internal/upstream 错误。
         if not base_url or not model:
             yield _ndjson({"type": "error", "code": provider.CODE_INTERNAL,
-                           "message": "会话未配置模型接口（Base URL 或模型名），请先在会话设置中完成配置"})
+                           "message": "所选模型预设缺少 Base URL 或模型名，"
+                                      "请在全局设置→模型预设中补全"})
             return
 
         gen = provider.stream_chat(
@@ -288,7 +314,7 @@ async def chat(session_id: str, body: ChatRequest, request: Request):
         # 第 1 点：content 去空白后非空。
         return _api_error(400, CODE_BAD_REQUEST, "消息内容不能为空")
 
-    # 会话存在性。api_key 用原始值（backend-core 的 get_session_raw，§5.1 打码版仅供 HTTP 回显）。
+    # 会话存在性（v0.6：会话已无模型配置，另用 get_model_preset_raw 解析预设）。
     session = db.get_session_raw(session_id)
     if session is None:
         return _api_error(404, CODE_NOT_FOUND, "会话不存在")
