@@ -26,6 +26,7 @@ from app import db
 from app.config import DEFAULT_HOST, DEFAULT_PORT, setup_logging
 from app.routers import chat as chat_router
 from app.routers import config as config_router
+from app.routers import model_presets as model_presets_router
 from app.routers import sessions as sessions_router
 from app.routers import worldbook as worldbook_router
 
@@ -71,6 +72,7 @@ def create_app() -> FastAPI:
     app.include_router(sessions_router.router)
     app.include_router(worldbook_router.router)
     app.include_router(chat_router.router)
+    app.include_router(model_presets_router.router)  # v0.6 全局模型预设
     return app
 
 

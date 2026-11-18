@@ -33,6 +33,23 @@ public sealed class RealApiBackendService : IBackendService
         _api = new ApiClient(string.IsNullOrWhiteSpace(baseUrl) ? DefaultBaseUrl : baseUrl);
     }
 
+    // ---------------- 全局模型预设（v0.6，待 services 智能体实现） ----------------
+
+    public Task<IReadOnlyList<ModelPreset>> ListModelPresetsAsync(CancellationToken ct = default)
+        => throw new NotImplementedException("模型预设尚未实现（v0.6 frontend-services 智能体实现）");
+
+    public Task<ModelPreset> CreateModelPresetAsync(ModelPreset preset, CancellationToken ct = default)
+        => throw new NotImplementedException("模型预设尚未实现（v0.6 frontend-services 智能体实现）");
+
+    public Task<ModelPreset?> UpdateModelPresetAsync(string id, ModelPreset preset, CancellationToken ct = default)
+        => throw new NotImplementedException("模型预设尚未实现（v0.6 frontend-services 智能体实现）");
+
+    public Task<bool> DeleteModelPresetAsync(string id, CancellationToken ct = default)
+        => throw new NotImplementedException("模型预设尚未实现（v0.6 frontend-services 智能体实现）");
+
+    public Task<TestConnectionResult> TestModelPresetAsync(string id, CancellationToken ct = default)
+        => throw new NotImplementedException("模型预设尚未实现（v0.6 frontend-services 智能体实现）");
+
     // ------------------------------------------------------------------
     // 会话
     // ------------------------------------------------------------------

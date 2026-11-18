@@ -22,13 +22,13 @@ public class SessionInfo
     /// <summary>世界书开关（默认开启）。</summary>
     public bool WorldbookEnabled { get; set; } = true;
 
-    /// <summary>模型 Base URL（OpenAI 兼容接口，可空）。</summary>
+    /// <summary>模型 Base URL（v0.6 废弃：会话不再持有模型配置，改用 <see cref="ModelPresetId"/>；保留仅为兼容旧代码，后端不再返回该字段）。</summary>
     public string BaseUrl { get; set; } = "";
 
-    /// <summary>打码后的 API Key（明文只存在后端本地库，接口仅回显打码，见 §5.1 mask_key）。</summary>
+    /// <summary>打码后的 API Key（v0.6 废弃：会话不再持有 API Key；后端不再返回该字段）。</summary>
     public string MaskedApiKey { get; set; } = "";
 
-    /// <summary>模型名（可空）。</summary>
+    /// <summary>模型名（v0.6 废弃：改用模型预设；后端不再返回该字段）。</summary>
     public string Model { get; set; } = "";
 
     /// <summary>采样温度，默认 1.0。</summary>
@@ -40,8 +40,11 @@ public class SessionInfo
     /// <summary>max_tokens，null = 上游默认。</summary>
     public int? MaxTokens { get; set; }
 
-    /// <summary>推理强度（v0.5①）：空串 = 不设置（不向上游发送）；可选 low / medium / high。</summary>
+    /// <summary>推理强度（v0.5① 起为会话字段；v0.6 废弃：改用模型预设；后端不再返回该字段）。</summary>
     public string ReasoningEffort { get; set; } = "";
+
+    /// <summary>所选全局模型预设 id（v0.6）：空串 = 未选择；聊天需先选择预设。</summary>
+    public string ModelPresetId { get; set; } = "";
 
     /// <summary>上下文总预算（字符），默认 80000；0 = 不裁剪（§6.3）。</summary>
     public int MaxContextChars { get; set; } = 80000;
@@ -73,6 +76,7 @@ public class SessionInfo
         TopP = TopP,
         MaxTokens = MaxTokens,
         ReasoningEffort = ReasoningEffort,
+        ModelPresetId = ModelPresetId,
         MaxContextChars = MaxContextChars,
         ProxyUrl = ProxyUrl,
         CreatedAt = CreatedAt,

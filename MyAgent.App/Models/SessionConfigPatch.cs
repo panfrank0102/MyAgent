@@ -19,9 +19,11 @@ public sealed class SessionConfigPatch
     public double? TopP { get; set; }
     public int? MaxTokens { get; set; }
 
-    /// <summary>推理强度（v0.5①）：null = 不设置（显式发送 null → 清除配置，不向上游发送）；
-    /// "low"/"medium"/"high" = 设置。仅支持三档，其余值后端 422。</summary>
+    /// <summary>推理强度（v0.5① 会话字段；v0.6 废弃：改用模型预设，传 null 不更新）。</summary>
     public string? ReasoningEffort { get; set; }
+
+    /// <summary>所选全局模型预设 id（v0.6）：null = 清除选择（未选择）；字符串 = 选择该预设。</summary>
+    public string? ModelPresetId { get; set; }
     public int? MaxContextChars { get; set; }
     public string? ProxyUrl { get; set; }
 }

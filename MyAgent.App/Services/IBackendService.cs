@@ -80,6 +80,32 @@ public interface IBackendService
     /// <summary>DELETE /api/sessions/{sid}/worldbook/{eid}：删除条目。</summary>
     Task<bool> DeleteWorldbookEntryAsync(string sessionId, string entryId, CancellationToken ct = default);
 
+    // ---------------- 全局模型预设（v0.6，全局设置 → 模型预设） ----------------
+
+    /// <summary>GET /api/model-presets：全部模型预设（按 created_at 升序，api_key 打码）。</summary>
+    Task<IReadOnlyList<ModelPreset>> ListModelPresetsAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// POST /api/model-presets：新建预设。ApiKeyInput 为明文（可为空）；Name 非空。
+    /// 返回打码后的预设快照。
+    /// </summary>
+    Task<ModelPreset> CreateModelPresetAsync(ModelPreset preset, CancellationToken ct = default);
+
+    /// <summary>
+    /// PATCH /api/model-presets/{id}：更新预设。ApiKeyInput 为 null/空 → 不更新已存 Key；
+    /// 其余字段按传入值更新（整表提交）。不存在返回 null。
+    /// </summary>
+    Task<ModelPreset?> UpdateModelPresetAsync(string id, ModelPreset preset, CancellationToken ct = default);
+
+    /// <summary>DELETE /api/model-presets/{id}：删除预设（引用它的会话自动置为未选择）。</summary>
+    Task<bool> DeleteModelPresetAsync(string id, CancellationToken ct = default);
+
+    /// <summary>
+    /// POST /api/model-presets/{id}/test-connection：用已保存预设（服务端存储的 Key）测试连通性。
+    /// 约定：不抛异常——失败返回 Ok=false 与中文原因；预设不存在返回 Ok=false 且 ErrorCode=not_found。
+    /// </summary>
+    Task<TestConnectionResult> TestModelPresetAsync(string id, CancellationToken ct = default);
+
     // ---------------- 连通性测试（Step 12） ----------------
 
     /// <summary>
