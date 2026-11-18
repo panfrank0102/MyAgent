@@ -10,3 +10,4 @@ MyAgent.App/bin/
 MyAgent.App/obj/
 MyAgent.App/.vs/
 *_wpftmp.csproj
+.vs/
