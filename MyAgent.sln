@@ -1,0 +1,54 @@
+
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MyAgent.App", "MyAgent.App\MyAgent.App.csproj", "{12B395E8-7370-48CF-B04C-DB1C2A6B0BE5}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "backend", "backend", "{F5C3A2B1-7E4D-4A8B-9C6F-1D2E3A4B5C6D}"
+	ProjectSection(SolutionItems) = preProject
+		backend\main.py = backend\main.py
+		backend\requirements.txt = backend\requirements.txt
+		backend\requirements-dev.txt = backend\requirements-dev.txt
+		backend\app\config.py = backend\app\config.py
+		backend\app\db.py = backend\app\db.py
+		backend\app\schemas.py = backend\app\schemas.py
+		backend\app\routers\chat.py = backend\app\routers\chat.py
+		backend\app\routers\config.py = backend\app\routers\config.py
+		backend\app\routers\sessions.py = backend\app\routers\sessions.py
+		backend\app\routers\worldbook.py = backend\app\routers\worldbook.py
+		backend\app\services\context.py = backend\app\services\context.py
+		backend\app\services\prompt_builder.py = backend\app\services\prompt_builder.py
+		backend\app\services\provider.py = backend\app\services\provider.py
+		backend\app\services\worldbook.py = backend\app\services\worldbook.py
+		backend\tests\test_chat_flow.py = backend\tests\test_chat_flow.py
+		backend\tests\test_context.py = backend\tests\test_context.py
+		backend\tests\test_db.py = backend\tests\test_db.py
+		backend\tests\test_prompt_builder.py = backend\tests\test_prompt_builder.py
+		backend\tests\test_provider.py = backend\tests\test_provider.py
+		backend\tests\test_sessions_api.py = backend\tests\test_sessions_api.py
+		backend\tests\test_worldbook_api.py = backend\tests\test_worldbook_api.py
+		backend\tests\test_worldbook_match.py = backend\tests\test_worldbook_match.py
+	EndProjectSection
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "docs", "docs", "{D8E7C6B5-A4F3-42E1-8B9A-3C2D1E0F9A8B}"
+	ProjectSection(SolutionItems) = preProject
+		需求与方案指导.md = 需求与方案指导.md
+		开发步骤分解.md = 开发步骤分解.md
+	EndProjectSection
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{12B395E8-7370-48CF-B04C-DB1C2A6B0BE5}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{12B395E8-7370-48CF-B04C-DB1C2A6B0BE5}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{12B395E8-7370-48CF-B04C-DB1C2A6B0BE5}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{12B395E8-7370-48CF-B04C-DB1C2A6B0BE5}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
