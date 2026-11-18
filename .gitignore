@@ -8,4 +8,5 @@ acl-recovery/
 # .NET 构建产物
 MyAgent.App/bin/
 MyAgent.App/obj/
+MyAgent.App/.vs/
 *_wpftmp.csproj
