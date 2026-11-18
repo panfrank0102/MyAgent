@@ -18,6 +18,7 @@ namespace MyAgent.App;
 /// </summary>
 public partial class MainWindow : Window
 {
+    private readonly IBackendService _backend;
     private readonly MainViewModel _viewModel;
 
     /// <summary>是否贴底跟随：用户上滚查看历史时暂停自动滚底，滚回底部后恢复。</summary>
@@ -26,12 +27,13 @@ public partial class MainWindow : Window
     /// <summary>是否已排队一次滚底：同一帧内多次集合变化只滚一次（见 OnMessagesCollectionChanged）。</summary>
     private bool _scrollRequestPending;
 
-    public MainWindow()
+    public MainWindow(IBackendService backend, IDialogService dialogs)
     {
         InitializeComponent();
 
-        // 组合根：假数据阶段注入 FakeBackendService；集成阶段替换为 ApiClient（配合 BackendManager）
-        _viewModel = new MainViewModel(new FakeBackendService(), new MessageBoxDialogService());
+        // 组合根：由 App.OnStartup 按 config.json 的 mode 注入 FakeBackendService 或 RealApiBackendService
+        _backend = backend;
+        _viewModel = new MainViewModel(backend, dialogs);
         DataContext = _viewModel;
 
         // 消息集合变化（增删/清空/重建）后滚动到底部。

@@ -139,6 +139,139 @@ public sealed class FakeBackendService : IBackendService
         }
     }
 
+    // ---------------- 会话配置（Step 12） ----------------
+
+    public async Task<SessionInfo?> GetSessionAsync(string id, CancellationToken ct = default)
+    {
+        await Task.Delay(20, ct);
+        lock (_lock)
+        {
+            var session = _sessions.FirstOrDefault(s => s.Id == id);
+            return session == null ? null : CloneWithCount(session);
+        }
+    }
+
+    public async Task<SessionInfo?> UpdateSessionConfigAsync(string id, SessionConfigPatch patch, CancellationToken ct = default)
+    {
+        await Task.Delay(30, ct);
+        lock (_lock)
+        {
+            var session = _sessions.FirstOrDefault(s => s.Id == id);
+            if (session == null) return null;
+
+            // v0.4① 语义：null = 未提供（跳过）；例外——base_url/model/max_tokens 的 null 表示清除配置。
+            // 设置页总是整表提交，max_tokens 为 null 即“清除，上游默认”。
+            if (patch.Name != null) session.Name = patch.Name.Trim();
+            if (patch.SystemPrompt != null) session.SystemPrompt = patch.SystemPrompt;
+            if (patch.ScanRounds.HasValue) session.ScanRounds = Math.Max(0, patch.ScanRounds.Value);
+            if (patch.WorldbookEnabled.HasValue) session.WorldbookEnabled = patch.WorldbookEnabled.Value;
+            if (patch.BaseUrl != null) session.BaseUrl = patch.BaseUrl;
+            if (patch.Model != null) session.Model = patch.Model;
+            session.MaxTokens = patch.MaxTokens; // null = 清除（上游默认）
+            if (patch.Temperature.HasValue) session.Temperature = patch.Temperature.Value;
+            if (patch.TopP.HasValue) session.TopP = patch.TopP.Value;
+            if (patch.MaxContextChars.HasValue) session.MaxContextChars = Math.Max(0, patch.MaxContextChars.Value);
+            if (patch.ProxyUrl != null) session.ProxyUrl = patch.ProxyUrl;
+            if (!string.IsNullOrWhiteSpace(patch.ApiKey)) session.MaskedApiKey = MaskKey(patch.ApiKey);
+
+            session.UpdatedAt = DateTimeOffset.UtcNow; // §5.1：更新自动刷新 updated_at
+            return CloneWithCount(session);
+        }
+    }
+
+    // ---------------- 世界书 CRUD（Step 13，每会话独立，§4.3） ----------------
+
+    public async Task<IReadOnlyList<WorldBookEntry>> ListWorldbookAsync(string sessionId, CancellationToken ct = default)
+    {
+        await Task.Delay(20, ct);
+        lock (_lock)
+        {
+            if (!_worldbooks.TryGetValue(sessionId, out var entries)) return Array.Empty<WorldBookEntry>();
+            // §5.1：按 sort_order 升序
+            return entries.OrderBy(e => e.SortOrder).Select(CloneEntry).ToList();
+        }
+    }
+
+    public async Task<WorldBookEntry> CreateWorldbookEntryAsync(string sessionId, WorldBookEntry entry, CancellationToken ct = default)
+    {
+        await Task.Delay(30, ct);
+        lock (_lock)
+        {
+            EnsureSession(sessionId);
+            var content = (entry.Content ?? "").Trim();
+            if (content.Length == 0) throw new InvalidOperationException("条目内容不能为空（§5/§10：空禁止保存）");
+            var entries = _worldbooks[sessionId];
+            var created = new WorldBookEntry
+            {
+                Id = Guid.NewGuid().ToString(),
+                SessionId = sessionId,
+                Name = (entry.Name ?? "").Trim(),
+                Keywords = NormalizeKeywords(entry.Keywords),
+                Content = content,
+                Enabled = entry.Enabled,
+                // §5.1：sort_order 缺省 = 本会话 max+1（假数据约定：SortOrder <= 0 视为缺省）
+                SortOrder = entry.SortOrder > 0
+                    ? entry.SortOrder
+                    : (entries.Count == 0 ? 1 : entries.Max(w => w.SortOrder) + 1),
+            };
+            entries.Add(created);
+            TouchSession(sessionId);
+            return CloneEntry(created);
+        }
+    }
+
+    public async Task<WorldBookEntry?> UpdateWorldbookEntryAsync(string sessionId, string entryId, WorldBookEntry entry, CancellationToken ct = default)
+    {
+        await Task.Delay(30, ct);
+        lock (_lock)
+        {
+            if (!_worldbooks.TryGetValue(sessionId, out var entries)) return null;
+            var existing = entries.FirstOrDefault(w => w.Id == entryId);
+            if (existing == null) return null; // 跨会话/不存在：null（对应后端 404，§5.1 会话隔离）
+
+            var content = (entry.Content ?? "").Trim();
+            if (content.Length == 0) throw new InvalidOperationException("条目内容不能为空（§5/§10：空禁止保存）");
+
+            existing.Name = (entry.Name ?? "").Trim();
+            existing.Keywords = NormalizeKeywords(entry.Keywords);
+            existing.Content = content;
+            existing.Enabled = entry.Enabled;
+            existing.SortOrder = entry.SortOrder;
+            TouchSession(sessionId);
+            return CloneEntry(existing);
+        }
+    }
+
+    public async Task<bool> DeleteWorldbookEntryAsync(string sessionId, string entryId, CancellationToken ct = default)
+    {
+        await Task.Delay(20, ct);
+        lock (_lock)
+        {
+            if (!_worldbooks.TryGetValue(sessionId, out var entries)) return false;
+            bool removed = entries.RemoveAll(w => w.Id == entryId) > 0;
+            if (removed) TouchSession(sessionId);
+            return removed;
+        }
+    }
+
+    // ---------------- 连通性测试（Step 12） ----------------
+
+    public async Task<TestConnectionResult> TestConnectionAsync(TestConnectionRequest request, CancellationToken ct = default)
+    {
+        await Task.Delay(150, ct); // 模拟连通性探测
+        if (string.IsNullOrWhiteSpace(request.BaseUrl) || string.IsNullOrWhiteSpace(request.Model))
+            return new TestConnectionResult
+            {
+                Ok = false,
+                Message = "请先填写 Base URL 与模型名（假数据模式仅做本地校验，未真实请求）",
+            };
+        return new TestConnectionResult
+        {
+            Ok = true,
+            Message = "连接成功（假数据模式模拟结果，未发起真实请求）",
+        };
+    }
+
     // ---------------- 流式生成 ----------------
 
     public async IAsyncEnumerable<ChatEvent> SendMessageAsync(string sessionId, string content, [EnumeratorCancellation] CancellationToken ct = default)
@@ -451,6 +584,25 @@ public sealed class FakeBackendService : IBackendService
 
         _nextMessageId = 10;
     }
+
+    private static WorldBookEntry CloneEntry(WorldBookEntry entry) => new()
+    {
+        Id = entry.Id,
+        SessionId = entry.SessionId,
+        Name = entry.Name,
+        Keywords = new List<string>(entry.Keywords),
+        Content = entry.Content,
+        Enabled = entry.Enabled,
+        SortOrder = entry.SortOrder,
+    };
+
+    /// <summary>关键词清洗（§5）：trim、去空行、去重，保持传入顺序。</summary>
+    private static List<string> NormalizeKeywords(IEnumerable<string>? keywords)
+        => keywords?.Select(k => k.Trim()).Where(k => k.Length > 0).Distinct().ToList() ?? new List<string>();
+
+    /// <summary>api_key 打码（§5.1 mask_key）：保留前 4 后 4，中间 *；不足 8 位全打码。</summary>
+    private static string MaskKey(string key)
+        => key.Length < 8 ? new string('*', key.Length) : key[..4] + new string('*', key.Length - 8) + key[^4..];
 
     private static ChatMessage SeedMessage(
         long id, string sessionId, MessageRole role, string content, DateTimeOffset createdAt,
