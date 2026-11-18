@@ -233,6 +233,115 @@ def test_patch_entry_partial_update(client: TestClient) -> None:
     assert body["name"] == "条目"  # 未传字段不动
 
 
+def test_patch_entry_null_fields_not_updated_false_updates(client: TestClient) -> None:
+    """PATCH 显式 null 一律不更新（含 bool enabled）；显式 false 必须生效。"""
+    sid = _make_session(client)
+    entry = _post_entry(client, sid)
+    assert entry["enabled"] is True
+
+    resp = client.patch(
+        f"/api/sessions/{sid}/worldbook/{entry['id']}",
+        json={"enabled": None, "keywords": None, "name": None, "content": None},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["enabled"] is True  # null 不更新
+    assert body["keywords"] == ["关键词"]  # null ≠ 清空（清空传 []）
+    assert body["name"] == "条目"
+    assert body["content"] == "内容"
+    assert db.get_worldbook_entry(sid, entry["id"])["enabled"] == 1
+
+    resp = client.patch(
+        f"/api/sessions/{sid}/worldbook/{entry['id']}", json={"enabled": False}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["enabled"] is False  # 显式 false 正常更新
+    assert db.get_worldbook_entry(sid, entry["id"])["enabled"] == 0
+
+
+def test_patch_entry_sort_order_upper_bound_422(client: TestClient) -> None:
+    """sort_order 超上界 → 422（不再 500），统一错误格式。"""
+    sid = _make_session(client)
+    entry = _post_entry(client, sid)
+
+    for value in (10_000_001, 10**19):
+        resp = client.patch(
+            f"/api/sessions/{sid}/worldbook/{entry['id']}", json={"sort_order": value}
+        )
+        assert resp.status_code == 422, value
+        body = resp.json()
+        assert set(body.keys()) == {"error"}
+        # 走 main.py 全局 422 handler，沿用项目既有 code（不新造 code）
+        assert body["error"]["code"] == "validation_error"
+        assert isinstance(body["error"]["message"], str) and body["error"]["message"]
+
+    # 超界请求不落库；上界本身仍可接受（宽松上界，不误伤合法值）
+    assert client.get(f"/api/sessions/{sid}/worldbook").json()[0]["sort_order"] == 1
+    resp = client.patch(
+        f"/api/sessions/{sid}/worldbook/{entry['id']}",
+        json={"sort_order": 10_000_000},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["sort_order"] == 10_000_000
+
+
+def test_create_entry_sort_order_out_of_int64_range_422(client: TestClient) -> None:
+    """POST sort_order 超出 SQLite int64 范围 → 422（不再 500），统一错误格式。
+
+    Create 模型此前无任何边界，10**19 会直接触发 INTEGER 绑定 OverflowError
+    → 500；边界仅为防溢出，不引入业务语义范围（负值仍接受）。
+    """
+    sid = _make_session(client)
+    for value in (10**19, -(10**19)):
+        resp = client.post(
+            f"/api/sessions/{sid}/worldbook",
+            json={"content": "内容", "sort_order": value},
+        )
+        assert resp.status_code == 422, value
+        body = resp.json()
+        assert set(body.keys()) == {"error"}
+        # 走 main.py 全局 422 handler，沿用项目既有 code（不新造 code）
+        assert body["error"]["code"] == "validation_error"
+        assert isinstance(body["error"]["message"], str) and body["error"]["message"]
+
+    # 超界请求不落库
+    assert client.get(f"/api/sessions/{sid}/worldbook").json() == []
+
+    # 上界与 int64 最小值仍可接受（宽松防溢出，不误伤合法值）
+    for value in (10_000_000, -(2**63)):
+        resp = client.post(
+            f"/api/sessions/{sid}/worldbook",
+            json={"content": "内容", "sort_order": value},
+        )
+        assert resp.status_code == 200, value
+        assert resp.json()["sort_order"] == value
+
+
+def test_patch_entry_sort_order_lower_bound_422(client: TestClient) -> None:
+    """PATCH sort_order 低于 SQLite int64 下界 → 422（不再 500），且不落库。"""
+    sid = _make_session(client)
+    entry = _post_entry(client, sid)
+
+    for value in (-(10**19), -(2**63) - 1):
+        resp = client.patch(
+            f"/api/sessions/{sid}/worldbook/{entry['id']}", json={"sort_order": value}
+        )
+        assert resp.status_code == 422, value
+        body = resp.json()
+        assert set(body.keys()) == {"error"}
+        assert body["error"]["code"] == "validation_error"
+        assert isinstance(body["error"]["message"], str) and body["error"]["message"]
+
+    # 超界不落库；int64 最小值本身仍可接受（不收紧为 ge=0）
+    assert client.get(f"/api/sessions/{sid}/worldbook").json()[0]["sort_order"] == 1
+    resp = client.patch(
+        f"/api/sessions/{sid}/worldbook/{entry['id']}",
+        json={"sort_order": -(2**63)},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["sort_order"] == -(2**63)
+
+
 def test_patch_entry_blank_content_422(client: TestClient) -> None:
     """PATCH 传入空白 content → 422。"""
     sid = _make_session(client)

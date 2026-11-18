@@ -75,7 +75,9 @@ def update_worldbook_entry(session_id: str, entry_id: str, payload: WorldbookEnt
     if not _check_session(session_id):
         return api_error(404, "session_not_found", "会话不存在")
     fields = payload.model_dump(exclude_unset=True)
-    if "keywords" in fields:
+    # 显式 null 视为"未提供"：保留 None 交给 DAO 跳过；若在此清洗会把 null
+    # 变成空串从而误清空 keywords（清空关键词应显式传 []）。
+    if fields.get("keywords") is not None:
         fields["keywords"] = normalize_keywords(fields["keywords"])
     entry = db.update_worldbook_entry(session_id, entry_id, fields)
     if entry is None:

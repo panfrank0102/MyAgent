@@ -41,7 +41,13 @@ public partial class MainWindow : Window
         // 切换会话时重置贴底状态（否则在上一个会话里上滚查看历史后，
         // 切到新会话仍处于“暂停跟随”，新会话不会自动滚到底部）
         _viewModel.PropertyChanged += OnViewModelPropertyChanged;
+
+        // 退出收尾：窗口关闭（含 App 关闭流程）时取消进行中的生成并停止节流定时器。
+        // 只在构造函数里订阅一次（等价于 XAML 的 Closed=，但不必改 XAML）；Shutdown 本身幂等。
+        Closed += Window_Closed;
     }
+
+    private void Window_Closed(object? sender, EventArgs e) => _viewModel.Shutdown();
 
     private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {

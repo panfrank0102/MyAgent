@@ -9,7 +9,8 @@
 
 覆盖（《开发步骤分解.md》Step 8 完成标准 + 任务要求）：
 meta→delta→done 序列、meta 必发且未命中为空数组、世界书命中 meta、
-error 映射（失败不落库 AI 回复）、regenerate 两分支、409 并发、
+error 映射（失败不落库 AI 回复）、regenerate 两分支、regenerate 缺少 user 输入时
+不删除消息（先删后判缺陷回归）、409 并发、
 客户端断开/框架取消 → interrupted=1 落库、test-connection、404/400。
 """
 
@@ -474,6 +475,40 @@ def test_regenerate_no_messages_400(env) -> None:
     resp = TestClient(env.app).post(f"/api/sessions/{env.session['id']}/regenerate")
     assert resp.status_code == 400
     assert resp.json()["error"]["code"] == "bad_request"
+
+
+@pytest.mark.parametrize("roles", [["assistant"], ["assistant", "assistant"]])
+def test_regenerate_without_user_input_400_keeps_messages(env, monkeypatch, roles: list[str]) -> None:
+    """回归（先删后判缺陷）：末条 assistant 但无可用上一条 user → 400 且不删任何消息。
+
+    旧实现先调用 delete_message_and_after 删除末条，再取 history[-2]；当 history 只有
+    一条 assistant（或倒数第二条不是 user）时删除后 content 为空 → 返回 400，但消息
+    已经被删掉，用户丢消息。修复后校验（len>=2 且 history[-2] 为 user）先于删除。
+    """
+    contents = [f"{role}-消息{i}" for i, role in enumerate(roles)]
+    for role, content in zip(roles, contents):
+        db.append_message(env.session["id"], role, content)
+    expected = list(zip(roles, contents))
+
+    calls: list[tuple] = []
+
+    async def fake_stream(*args: Any, **kwargs: Any):
+        calls.append(args)          # 记录是否真的发起过上游生成
+        yield "不该生成"             # pragma: no cover —— 走到这里说明校验没拦住
+
+    monkeypatch.setattr(provider_mod, "stream_chat", fake_stream)
+    resp = TestClient(env.app).post(f"/api/sessions/{env.session['id']}/regenerate")
+
+    assert resp.status_code == 400
+    body = resp.json()
+    # 统一错误格式（§4.3），code 沿用本端点既有 400 风格
+    assert body["error"]["code"] == "bad_request"
+    assert set(body["error"]) == {"code", "message"}
+    assert "没有可重新生成的用户消息" in body["error"]["message"]
+    # 关键断言：消息一条都没被删除（旧实现的缺陷点）
+    assert [(m["role"], m["content"]) for m in db.list_messages(env.session["id"])] == expected
+    assert calls == []                                        # 未触发上游生成
+    assert env.session["id"] not in chat_mod._in_flight        # 生成权已释放（幂等）
 
 
 # ---------------------------------------------------------------------------

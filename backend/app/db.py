@@ -332,10 +332,10 @@ def update_session(session_id: str, fields: dict) -> dict | None:
     规则：
         - 未知键忽略（白名单 _SESSION_COLUMNS）；
         - api_key 传 None / 空串 → 跳过（§4.3：仅非空值更新）；
-        - base_url / model / max_tokens 传 None → 置 NULL（清除配置）；
+        - 显式 null 一律视为"未提供 → 不更新"，唯一例外是 _SESSION_NULLABLE
+          （base_url / model / max_tokens）用 null 表示"清除配置"置 NULL；
         - proxy_url 为 NOT NULL 列，传 None 视为"未提供"（清除代理用空串）；
-        - 其余列传 None → 视为"未提供"跳过；
-        - worldbook_enabled 统一存 0/1。
+        - worldbook_enabled 统一存 0/1；显式 false 正常写入 0。
     """
     if not fields:
         # 空更新也算"会话存在"，直接返回当前值（updated_at 不动，契约未要求）。
@@ -347,20 +347,23 @@ def update_session(session_id: str, fields: dict) -> dict | None:
         if column not in fields:
             continue
         value = fields[column]
+        # 显式 null 统一按"未提供 → 不更新"处理（PATCH 语义，所有列一致）：
+        # 可空配置列例外，null 表示"清除配置 → 置 NULL"。必须先判 None，
+        # 否则 worldbook_enabled 分支的 `1 if value else 0` 会把 null 误写成 0。
+        if value is None:
+            if column in _SESSION_NULLABLE:
+                sets.append(f"{column} = NULL")
+            continue
         if column == "api_key":
             # api_key 仅在传入非空值时更新（§4.3 PATCH 语义）
-            if value is None or str(value).strip() == "":
+            if str(value).strip() == "":
                 continue
             sets.append("api_key = ?")
             params.append(str(value))
         elif column == "worldbook_enabled":
-            # 0/1 整型存储（表结构 §5）
+            # 0/1 整型存储（表结构 §5）；显式 false 正常写入 0
             sets.append("worldbook_enabled = ?")
             params.append(1 if value else 0)
-        elif value is None and column in _SESSION_NULLABLE:
-            sets.append(f"{column} = NULL")
-        elif value is None:
-            continue  # 不可空列传 None 视为未提供
         else:
             sets.append(f"{column} = ?")
             params.append(value)
@@ -584,14 +587,17 @@ def update_worldbook_entry(session_id: str, entry_id: str, fields: dict) -> dict
         if column not in fields:
             continue
         value = fields[column]
+        # 显式 null 统一按"未提供 → 不更新"处理（PATCH 语义，所有列一致）。
+        # 清空 keywords 请传 []（空列表是显式值）。此判断必须先于 enabled
+        # 分支，否则 `1 if value else 0` 会把 null 误写成 0。
+        if value is None:
+            continue
         if column == "keywords":
             sets.append("keywords = ?")
             params.append(_normalize_keywords_value(value))
         elif column == "enabled":
             sets.append("enabled = ?")
             params.append(1 if value else 0)
-        elif value is None:
-            continue  # 其余列传 None 视为未提供
         else:
             sets.append(f"{column} = ?")
             params.append(value)

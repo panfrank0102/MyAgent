@@ -281,6 +281,25 @@ def test_update_session_nullable_fields(dbfile: Path) -> None:
     assert db.update_session(session["id"], {"worldbook_enabled": False})["worldbook_enabled"] == 0
 
 
+def test_update_session_null_bool_not_updated(dbfile: Path) -> None:
+    """PATCH 显式 null 的 bool 字段视为未提供（不更新）；显式 false 正常写入 0。"""
+    session = db.create_session("s")
+    assert session["worldbook_enabled"] == 1
+
+    unchanged = db.update_session(session["id"], {"worldbook_enabled": None})
+    assert unchanged is not None
+    assert unchanged["worldbook_enabled"] == 1  # null ≠ false
+    assert db.get_session_raw(session["id"])["worldbook_enabled"] == 1
+
+    disabled = db.update_session(session["id"], {"worldbook_enabled": False})
+    assert disabled is not None
+    assert disabled["worldbook_enabled"] == 0  # 显式 false 正常更新
+
+    enabled = db.update_session(session["id"], {"worldbook_enabled": True})
+    assert enabled is not None
+    assert enabled["worldbook_enabled"] == 1
+
+
 def test_delete_session_cascades(dbfile: Path) -> None:
     """delete_session 级联删除消息与世界书条目；不存在返回 False。"""
     session = db.create_session("s")
@@ -426,6 +445,40 @@ def test_worldbook_list_sorted_and_update_partial(dbfile: Path) -> None:
     # 关键词更新：list → 换行 TEXT
     updated2 = db.update_worldbook_entry(session["id"], ids[0], {"keywords": ["a", "b"]})
     assert updated2 is not None and updated2["keywords"] == "a\nb"
+
+
+def test_worldbook_update_null_fields_not_updated(dbfile: Path) -> None:
+    """PATCH 显式 null 一律不更新（含 bool enabled）；显式 false / [] 正常生效。"""
+    session = db.create_session("s")
+    entry = db.create_worldbook_entry(
+        session["id"], {"name": "n", "keywords": ["猫耳"], "content": "c"}
+    )
+
+    unchanged = db.update_worldbook_entry(
+        session["id"],
+        entry["id"],
+        {
+            "name": None,
+            "keywords": None,
+            "content": None,
+            "enabled": None,
+            "sort_order": None,
+        },
+    )
+    assert unchanged is not None
+    assert unchanged["name"] == "n"
+    assert unchanged["keywords"] == "猫耳"  # null ≠ 清空（清空传 []）
+    assert unchanged["content"] == "c"
+    assert unchanged["enabled"] == 1  # null ≠ false
+    assert unchanged["sort_order"] == entry["sort_order"]
+
+    # 显式 false 正常更新为 0；清空 keywords 用显式空列表
+    updated = db.update_worldbook_entry(
+        session["id"], entry["id"], {"enabled": False, "keywords": []}
+    )
+    assert updated is not None
+    assert updated["enabled"] == 0
+    assert updated["keywords"] == ""
 
 
 def test_worldbook_cross_session_isolation(dbfile: Path) -> None:

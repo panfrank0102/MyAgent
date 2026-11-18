@@ -308,8 +308,12 @@ async def chat(session_id: str, body: ChatRequest, request: Request):
 async def regenerate(session_id: str, request: Request):
     """重新生成上一条回复（流式，§4.3 / §6.1）。
 
-    分支（§4.3）：末条为 assistant → 先删除该条再生成；末条为 user → 直接重试
+    分支（§4.3）：末条为 assistant → 先校验（历史里必须有可用的上一条 user 消息）
+    再删除该条并生成；校验不通过则直接 400 且不删除任何消息；末条为 user → 直接重试
     （以该条为输入、不新增用户消息）；无消息 → 4xx。
+
+    注意顺序：校验必须先于删除。旧实现"先删后判"会在缺少 user 输入时先删掉末条
+    assistant 再返回 400，导致用户丢一条消息（已修复，回归用例见 test_chat_flow.py）。
     """
     session = db.get_session_raw(session_id)
     if session is None:
@@ -327,10 +331,16 @@ async def regenerate(session_id: str, request: Request):
     try:
         last = history[-1]
         if last["role"] == "assistant":
+            # 先校验再删除（顺序不可颠倒）：删除后要以"其前一条"为输入，因此必须先
+            # 确认存在上一条且为 user，否则立即 400 且不删除任何消息（不丢用户数据）。
+            if len(history) < 2 or history[-2]["role"] != "user":
+                _release_generation(session_id)
+                return _api_error(400, CODE_BAD_REQUEST,
+                                  "没有可重新生成的用户消息（缺少上一条用户提问），未删除任何消息")
             # 末条为 assistant：删除该条（它必是最后一条，级联删除等价于删它自身）。
             db.delete_message_and_after(session_id, last["id"])
-            # 删除后当前输入 = 其前一条消息（按删除级联语义必为 user 消息）。
-            content = history[-2]["content"] if len(history) >= 2 else ""
+            # 删除后当前输入 = 其前一条 user 消息。
+            content = history[-2]["content"] or ""
         else:
             # 末条为 user：直接以其为输入重试，不新增用户消息。
             content = last["content"] or ""

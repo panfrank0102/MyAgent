@@ -16,7 +16,8 @@ namespace MyAgent.App.ViewModels;
 ///  - Sessions / Messages 两个集合实例不整体替换（只 Clear/Add/Move），保证 View 订阅稳定；
 ///  - 每会话独立的 CancellationTokenSource：同会话同时仅一个生成，不同会话可并行（§8）；
 ///  - 流式 delta 先累积到各 MessageItemViewModel.PendingText，共享 30ms DispatcherTimer 统一冲刷；
-///  - 生成结束后从服务重新拉取消息，使界面与服务端（含 interrupted 落库）保持一致。
+///  - 生成结束后从服务重新拉取消息，使界面与服务端（含 interrupted 落库）保持一致；
+///  - 应用退出时由 View 调用 <see cref="Shutdown"/>：逐个取消进行中的生成并停止节流定时器（幂等）。
 /// </summary>
 public partial class MainViewModel : ObservableObject
 {
@@ -47,6 +48,9 @@ public partial class MainViewModel : ObservableObject
 
     /// <summary>30ms 节流定时器：所有正在生成的会话共用，冲刷各自的 pending 缓冲（§8）。</summary>
     private DispatcherTimer? _flushTimer;
+
+    /// <summary>是否已执行退出收尾（Shutdown 的幂等标记，避免重复取消/重复停表）。</summary>
+    private bool _isShutdown;
 
     public MainViewModel(IBackendService backend, IDialogService dialogs)
     {
@@ -471,14 +475,20 @@ public partial class MainViewModel : ObservableObject
     private void AppendDelta(MessageItemViewModel live, string text)
     {
         live.AppendDelta(text);
+        // 已退出收尾（窗口已关闭）：不再创建/启动定时器。此时迟到的 delta 只进缓冲，
+        // 不再驱动 UI 刷新，避免退出后仍有 DispatcherTimer 在跑（正式后端下也不会再产生 UI 工作）。
+        if (_isShutdown) return;
         if (_flushTimer == null)
         {
             // 30ms 节流（§8）：多个会话的 delta 各攒各的缓冲，共享一个 UI 定时器合并刷新
             _flushTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(30) };
-            _flushTimer.Tick += (_, _) => FlushAllPending();
+            _flushTimer.Tick += OnFlushTimerTick;
         }
         if (!_flushTimer.IsEnabled) _flushTimer.Start();
     }
+
+    /// <summary>节流定时器 Tick：统一冲刷各会话的 pending 缓冲。</summary>
+    private void OnFlushTimerTick(object? sender, EventArgs e) => FlushAllPending();
 
     /// <summary>把所有会话 pending 缓冲一次性写入 Content；全部清空后停表省资源。</summary>
     private void FlushAllPending()
@@ -502,5 +512,46 @@ public partial class MainViewModel : ObservableObject
     private void StopGeneration(SessionItemViewModel session)
     {
         if (_generationCts.TryGetValue(session.Id, out var cts)) cts.Cancel();
+    }
+
+    /// <summary>
+    /// 应用退出收尾（幂等、不抛异常）：逐个取消所有进行中的生成，停止并解绑 30ms 节流定时器。
+    /// 由 MainWindow.Closed 调用；必须在 UI 线程执行（Closed 即 UI 线程，DispatcherTimer 只能在该线程停表）。
+    /// 刻意保持同步、不 await 任何生成任务：退出路径等待异步流程才容易死锁；取消后各生成流程
+    /// 在自己的 catch/finally 里收尾（保留部分文本、刷新列表），即使窗口已关闭也不会阻塞退出。
+    /// </summary>
+    public void Shutdown()
+    {
+        if (_isShutdown) return; // 幂等：Closed 与其它退出路径重复调用直接返回（也避免取消回调重入）
+        _isShutdown = true;
+
+        // 1) 逐个取消各会话的 CTS（不同会话可并行生成，故每个会话各有一个令牌源）。
+        //    先取快照再 Cancel：Cancel 会同步触发已注册的取消回调，避免枚举期间字典被改动。
+        foreach (var cts in _generationCts.Values.ToArray())
+        {
+            try
+            {
+                cts.Cancel();
+            }
+            catch (Exception)
+            {
+                // ObjectDisposedException（生成恰在此刻结束并释放）或取消回调抛出的 AggregateException：
+                // 退出路径吞掉，保证窗口正常关闭；不改变任何面向用户的行为。
+            }
+        }
+
+        // 2) 停表、解绑 Tick 并置空引用：Shutdown 之后 AppendDelta 会因 _isShutdown 短路，不再重新建表。
+        var timer = _flushTimer;
+        _flushTimer = null;
+        if (timer == null) return;
+        try
+        {
+            timer.Stop();
+        }
+        catch (Exception)
+        {
+            // 理论上仅当非 UI 线程调用时抛（DispatcherTimer.Stop 要求同线程）；退出路径忽略。
+        }
+        timer.Tick -= OnFlushTimerTick;
     }
 }

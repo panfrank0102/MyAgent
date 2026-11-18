@@ -116,6 +116,32 @@ def test_get_detail_and_patch_partial(client: TestClient) -> None:
     assert detail["name"] == "改"
 
 
+def test_patch_null_bool_not_updated_false_updates(client: TestClient) -> None:
+    """PATCH 显式 null 的 bool 字段 = 未提供（不更新）；显式 false 必须生效。"""
+    session = _create_session(client)
+    assert session["worldbook_enabled"] is True
+
+    resp = client.patch(
+        f"/api/sessions/{session['id']}", json={"worldbook_enabled": None}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["worldbook_enabled"] is True  # null 不更新
+    assert db.get_session_raw(session["id"])["worldbook_enabled"] == 1
+
+    resp = client.patch(
+        f"/api/sessions/{session['id']}", json={"worldbook_enabled": False}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["worldbook_enabled"] is False  # 显式 false 正常更新
+    assert db.get_session_raw(session["id"])["worldbook_enabled"] == 0
+
+    resp = client.patch(
+        f"/api/sessions/{session['id']}", json={"worldbook_enabled": True}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["worldbook_enabled"] is True
+
+
 def test_patch_api_key_masked_and_empty_not_update(client: TestClient) -> None:
     """api_key：非空才更新；读路径（详情/列表/回显）一律打码。"""
     session = _create_session(client)
@@ -209,6 +235,96 @@ def test_messages_invalid_limit_422(client: TestClient) -> None:
     body = resp.json()
     assert body["error"]["code"] == "invalid_param"
     assert "message" in body["error"]
+
+
+def test_messages_limit_upper_bound_422(client: TestClient) -> None:
+    """limit 超过 10000 → 422（不再 500），沿用 invalid_param 统一错误格式。"""
+    session = _create_session(client)
+    db.append_message(session["id"], "user", "m")
+
+    for limit in (10001, 10**19):
+        resp = client.get(
+            f"/api/sessions/{session['id']}/messages", params={"limit": limit}
+        )
+        assert resp.status_code == 422, limit
+        body = resp.json()
+        assert set(body.keys()) == {"error"}
+        assert body["error"]["code"] == "invalid_param"
+        assert isinstance(body["error"]["message"], str) and body["error"]["message"]
+
+    # 上界本身仍可接受（宽松上界，不误伤合法值）
+    resp = client.get(
+        f"/api/sessions/{session['id']}/messages", params={"limit": 10000}
+    )
+    assert resp.status_code == 200
+    assert [m["id"] for m in resp.json()] == [1]
+
+
+def test_patch_numeric_upper_bound_422(client: TestClient) -> None:
+    """scan_rounds / max_tokens / max_context_chars 超上界 → 422（不再 500）。"""
+    session = _create_session(client)
+    cases = [
+        ("scan_rounds", 1001),
+        ("scan_rounds", 10**19),
+        ("max_tokens", 10_000_001),
+        ("max_tokens", 10**19),
+        ("max_context_chars", 100_000_001),
+        ("max_context_chars", 10**19),
+    ]
+    for field, value in cases:
+        resp = client.patch(f"/api/sessions/{session['id']}", json={field: value})
+        assert resp.status_code == 422, (field, value)
+        body = resp.json()
+        assert set(body.keys()) == {"error"}
+        # 走 main.py 全局 422 handler，沿用项目既有 code（不新造 code）
+        assert body["error"]["code"] == "validation_error"
+        assert isinstance(body["error"]["message"], str) and body["error"]["message"]
+
+    # 超界请求不落库：原值保持不变
+    raw = db.get_session_raw(session["id"])
+    assert raw["scan_rounds"] == 4
+    assert raw["max_tokens"] is None
+    assert raw["max_context_chars"] == 80000
+
+    # 精确上界仍可接受（宽松上界，不引入业务语义范围）
+    resp = client.patch(
+        f"/api/sessions/{session['id']}",
+        json={
+            "scan_rounds": 1000,
+            "max_tokens": 10_000_000,
+            "max_context_chars": 100_000_000,
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["scan_rounds"] == 1000
+    assert body["max_tokens"] == 10_000_000
+    assert body["max_context_chars"] == 100_000_000
+
+
+def test_patch_max_tokens_lower_bound_422(client: TestClient) -> None:
+    """max_tokens 低于 SQLite int64 下界 → 422（不再 500），且不落库。
+
+    max_tokens 本身无业务下界，故下界仅拦截会触发 OverflowError 的
+    溢出级负值；负值（含 int64 最小值）仍按既有行为接受。
+    """
+    session = _create_session(client)
+    for value in (-(10**19), -(2**63) - 1):
+        resp = client.patch(f"/api/sessions/{session['id']}", json={"max_tokens": value})
+        assert resp.status_code == 422, value
+        body = resp.json()
+        assert set(body.keys()) == {"error"}
+        assert body["error"]["code"] == "validation_error"
+        assert isinstance(body["error"]["message"], str) and body["error"]["message"]
+
+    # 超界请求不落库：max_tokens 仍为默认 None
+    assert db.get_session_raw(session["id"])["max_tokens"] is None
+
+    # int64 最小值与普通负值仍可接受（不收紧为 ge=0，避免超范围行为变更）
+    for value in (-(2**63), -1):
+        resp = client.patch(f"/api/sessions/{session['id']}", json={"max_tokens": value})
+        assert resp.status_code == 200, value
+        assert resp.json()["max_tokens"] == value
 
 
 def test_clear_messages(client: TestClient) -> None:

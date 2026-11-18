@@ -70,20 +70,28 @@ class SessionUpdate(BaseModel):
 
     - api_key 仅在传入非空值时更新（DAO 层兜底，见 db.update_session）；
     - scan_rounds 最小 0（§5：只扫当前输入）；max_context_chars 最小 0
-      （0 = 不裁剪，§6.3）。
+      （0 = 不裁剪，§6.3）；
+    - 数值字段的 le 上界是**宽松防溢出保护**（不是业务语义范围）：仅用于挡住
+      10**19 这类会让 SQLite INTEGER 绑定抛 OverflowError → 500 的异常输入，
+      合法业务大值不受影响；
+    - max_tokens 无业务下界，ge=-(2**63) 同样只是防溢出：SQLite INTEGER 为
+      int64，比 int64 更小的负值会 OverflowError → 500；负 max_tokens 目前
+      可正常落库，故不收紧为 ge=0；
+    - 超界由 main.py 的全局 422 handler 统一成
+      {"error": {"code": "validation_error", "message": ...}}。
     """
 
     name: str | None = None
     system_prompt: str | None = None
-    scan_rounds: int | None = Field(default=None, ge=0)
+    scan_rounds: int | None = Field(default=None, ge=0, le=1000)
     worldbook_enabled: bool | None = None
     base_url: str | None = None
     api_key: str | None = None
     model: str | None = None
     temperature: float | None = None
     top_p: float | None = None
-    max_tokens: int | None = None
-    max_context_chars: int | None = Field(default=None, ge=0)
+    max_tokens: int | None = Field(default=None, ge=-(2**63), le=10_000_000)
+    max_context_chars: int | None = Field(default=None, ge=0, le=100_000_000)
     proxy_url: str | None = None
 
 
@@ -156,14 +164,16 @@ class WorldbookEntryCreate(BaseModel):
 
     - content 必填且去空白后非空（空禁止保存，§5 / §10）；
     - keywords 传入列表，路由层清洗后以换行分隔存 TEXT；
-    - sort_order 缺省 = None → DAO 取本会话 max+1（§5.1）。
+    - sort_order 缺省 = None → DAO 取本会话 max+1（§5.1）；
+    - sort_order 的 ge/le 仅为防 SQLite INTEGER 溢出（int64 之外 → 500），
+      不是业务语义范围；负值仍按既有行为接受，不收窄为 ge=0。
     """
 
     name: str = ""
     keywords: list[str] = Field(default_factory=list)
     content: str
     enabled: bool = True
-    sort_order: int | None = None
+    sort_order: int | None = Field(default=None, ge=-(2**63), le=10_000_000)
 
     @field_validator("content")
     @classmethod
@@ -175,13 +185,17 @@ class WorldbookEntryCreate(BaseModel):
 
 
 class WorldbookEntryUpdate(BaseModel):
-    """PATCH /api/sessions/{sid}/worldbook/{eid} 请求体：字段可选（§4.3）。"""
+    """PATCH /api/sessions/{sid}/worldbook/{eid} 请求体：字段可选（§4.3）。
+
+    sort_order 的 ge/le 仅为防 SQLite INTEGER 溢出（int64 之外 → 500），
+    不是业务语义范围；负值仍按既有行为接受，不收窄为 ge=0。
+    """
 
     name: str | None = None
     keywords: list[str] | None = None
     content: str | None = None
     enabled: bool | None = None
-    sort_order: int | None = None
+    sort_order: int | None = Field(default=None, ge=-(2**63), le=10_000_000)
 
     @field_validator("content")
     @classmethod

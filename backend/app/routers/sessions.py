@@ -102,12 +102,14 @@ def delete_session(session_id: str) -> dict:
 def list_messages(session_id: str, limit: int = Query(default=200, description="返回条数")):
     """历史消息：最新 limit 条，按 id 正序返回，含 interrupted 标记（§4.3）。
 
-    limit 默认 200；limit < 1 视为无效参数 422。
+    limit 默认 200；limit < 1 视为无效参数 422。上界 10000 是宽松防溢出保护
+    （防止 10**19 这类值让 SQLite LIMIT 绑定抛 OverflowError → 500），
+    不是业务语义范围；超界同样按 invalid_param 返回 422。
     """
     if db.get_session(session_id) is None:
         return api_error(404, "session_not_found", "会话不存在")
-    if limit < 1:
-        return api_error(422, "invalid_param", "limit 必须为正整数")
+    if limit < 1 or limit > 10000:
+        return api_error(422, "invalid_param", "limit 必须为 1~10000 的整数")
     return db.list_messages(session_id, limit)
 
 
