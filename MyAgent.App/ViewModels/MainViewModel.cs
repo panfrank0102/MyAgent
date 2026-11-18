@@ -130,8 +130,9 @@ public partial class MainViewModel : ObservableObject
     /// <summary>
     /// 从服务端刷新会话列表：按 id 复用 VM 实例（保留草稿/生成状态），
     /// 移除已不存在的、按 updated_at 倒序重排，不整体替换集合。
+    /// 同时供会话设置窗口关闭后回调用（Step 12：保存配置后刷新列表/会话名）。
     /// </summary>
-    private async Task RefreshSessionsAsync()
+    public async Task RefreshSessionsAsync()
     {
         try
         {

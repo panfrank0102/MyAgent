@@ -6,6 +6,7 @@ using System.Windows.Input;
 using System.Windows.Threading;
 using MyAgent.App.Services;
 using MyAgent.App.ViewModels;
+using MyAgent.App.Views;
 
 namespace MyAgent.App;
 
@@ -60,6 +61,29 @@ public partial class MainWindow : Window
     private async void Window_Loaded(object sender, RoutedEventArgs e)
     {
         await _viewModel.InitializeAsync(); // 加载假数据会话并选中第一个
+    }
+
+    /// <summary>
+    /// Step 12 入口：以“当前选中会话”打开会话设置窗口（模态）。
+    /// 关闭后若保存过配置，则刷新会话列表/会话名（updates_at 变化还会引发列表重排）。
+    /// 窗口本身负责错误条展示；这里兜底防止窗口装配异常变成未处理异常。
+    /// </summary>
+    private async void OpenSettings_Click(object sender, RoutedEventArgs e)
+    {
+        var session = _viewModel.SelectedSession;
+        if (session == null) return; // 按钮已由 HasSession 禁用，此处双保险
+
+        try
+        {
+            var window = new SettingsWindow(_backend, session.Id) { Owner = this };
+            window.ShowDialog();
+            if (window.ConfigSaved)
+                await _viewModel.RefreshSessionsAsync(); // 保存过：刷新会话列表/名
+        }
+        catch (Exception ex)
+        {
+            _viewModel.ErrorText = "打开会话设置失败：" + ex.Message;
+        }
     }
 
     private void OnMessagesCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
