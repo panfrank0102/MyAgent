@@ -31,11 +31,6 @@ from app.schemas import (
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
 
-def _session_or_404(session_id: str) -> dict:
-    """会话存在性检查；不存在时返回 404 错误响应（会话不存在，§4.3）。"""
-    return db.get_session(session_id)
-
-
 # ---------------------------------------------------------------------------
 # 会话 CRUD
 # ---------------------------------------------------------------------------

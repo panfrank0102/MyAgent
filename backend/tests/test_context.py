@@ -137,3 +137,17 @@ def test_trim_does_not_mutate_input() -> None:
     history = [_msg("aaaa"), _msg("bbbb")]
     trim_history(history, 1)
     assert len(history) == 2  # 入参未被修改
+
+
+def test_trim_large_history_keeps_exact_suffix() -> None:
+    """大历史单遍裁剪：整条丢弃后的结果 = 原列表的后缀（不多丢也不少丢）。"""
+    # 每条 "a"*400 → ASCII 400 → 100 token；50 条共 5000 token
+    history = [_msg("a" * 400) for _ in range(50)]
+    out = trim_history(history, 550)  # 只能容纳 5 条（500 ≤ 550 < 600）
+    assert out == history[-5:]
+    assert len(out) == 5
+    # 边界：预算恰好等于 5 条估算值时不多丢
+    assert trim_history(history, 500) == history[-5:]
+    # 预算比 6 条少 1 token 时必须丢到 5 条
+    assert trim_history(history, 599) == history[-5:]
+

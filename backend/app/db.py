@@ -197,13 +197,17 @@ def init_db(path: Path | None = None) -> None:
         for version, script in MIGRATIONS:
             if version <= current:
                 continue  # 已执行过的版本跳过（幂等）
-            # executescript 会先提交挂起事务，因此把 BEGIN/COMMIT 写进脚本自身，
-            # 使"整段 DDL + 版本号更新"作为一个原子事务执行。
-            conn.executescript(f"BEGIN;\n{script}\nCOMMIT;")
-            conn.execute(
-                "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (str(version),),
+            # executescript 会先提交挂起事务，因此把 BEGIN/COMMIT 写进脚本自身；
+            # schema_version 的更新也放进同一个事务，使"整段 DDL + 版本号更新"
+            # 原子落盘（若分两次提交，进程在 DDL 已提交、版本号未写入之间崩溃时，
+            # 下次启动会重复执行建表而报 "table already exists"）。
+            # executescript 不支持参数绑定，version 来自受信的 MIGRATIONS 常量，
+            # 先 int() 归一后再拼接，无注入风险。
+            # 约束：MIGRATIONS 中的脚本自身不得包含事务控制语句（BEGIN/COMMIT/ROLLBACK）。
+            conn.executescript(
+                f"BEGIN;\n{script}\n"
+                f"INSERT INTO meta(key, value) VALUES('schema_version', '{int(version)}') "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value;\nCOMMIT;"
             )
     finally:
         conn.close()

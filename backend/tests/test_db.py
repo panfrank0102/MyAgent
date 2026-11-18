@@ -82,6 +82,80 @@ def test_init_db_idempotent_and_schema_version(dbfile: Path) -> None:
         conn.close()
 
 
+def test_init_db_incremental_migration(dbfile: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """MIGRATIONS 追加新版本：只执行未应用版本，schema_version 递增且可重入。"""
+    monkeypatch.setattr(
+        db,
+        "MIGRATIONS",
+        [
+            (1, db.SCHEMA_V1),
+            (2, "CREATE TABLE demo_incremental (id INTEGER PRIMARY KEY);"),
+        ],
+    )
+    db.init_db(dbfile)  # 当前已是 v1，只应执行 v2
+    db.init_db(dbfile)  # 再次调用幂等
+    conn = sqlite3.connect(str(dbfile))
+    try:
+        version = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+        tables = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    finally:
+        conn.close()
+    assert version == "2"
+    assert "demo_incremental" in tables
+    assert {"sessions", "messages", "worldbook_entries"} <= tables  # 旧版本对象保留
+
+
+def test_init_db_failed_migration_rolls_back(
+    dbfile: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """迁移脚本中途失败：DDL 与 schema_version 同一事务回滚，修正后可继续升级。"""
+    monkeypatch.setattr(
+        db,
+        "MIGRATIONS",
+        [
+            (1, db.SCHEMA_V1),
+            (2, "CREATE TABLE half_migrated (id INTEGER);\nINSERT INTO no_such_table VALUES (1);"),
+        ],
+    )
+    with pytest.raises(sqlite3.OperationalError):
+        db.init_db(dbfile)
+
+    conn = sqlite3.connect(str(dbfile))
+    try:
+        version = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+        tables = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    finally:
+        conn.close()
+    assert version == "1"                 # 版本号未前进（回滚）
+    assert "half_migrated" not in tables  # 半成品 DDL 已回滚
+    assert {"sessions", "messages", "worldbook_entries"} <= tables
+
+    # 修正迁移脚本后重新初始化：正常升到 v2，说明失败未留下不可恢复状态
+    monkeypatch.setattr(
+        db,
+        "MIGRATIONS",
+        [
+            (1, db.SCHEMA_V1),
+            (2, "CREATE TABLE half_migrated (id INTEGER PRIMARY KEY);"),
+        ],
+    )
+    db.init_db(dbfile)
+    conn = sqlite3.connect(str(dbfile))
+    try:
+        version = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+        tables = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    finally:
+        conn.close()
+    assert version == "2"
+    assert "half_migrated" in tables
+
+
 # ---------------------------------------------------------------------------
 # api_key 打码（§5.1 mask_key）
 # ---------------------------------------------------------------------------

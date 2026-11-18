@@ -247,6 +247,8 @@ def test_chat_meta_delta_done_sequence(env, monkeypatch) -> None:
     assert msgs[0]["content"] == "你好呀"  # 存库前 strip 首尾空白
     assert msgs[1]["content"] == "你好，世界"
     assert msgs[1]["interrupted"] == 0
+    # 正常结束后生成权已释放，可再次发送
+    assert env.session["id"] not in chat_mod._in_flight
 
 
 def test_chat_done_usage_null_when_absent(env, monkeypatch) -> None:
@@ -323,6 +325,54 @@ def test_chat_scan_rounds_zero_only_current_input(env, monkeypatch) -> None:
     assert _events(resp)[0]["matched_entries"] == []
 
 
+def test_chat_scan_window_only_recent_2x_rounds(env, monkeypatch) -> None:
+    """扫描窗口 = 最近 2×scan_rounds 条平铺消息；窗口外的历史不参与匹配。"""
+    db.update_session(env.session["id"], {"scan_rounds": 1})
+    db.create_worldbook_entry(env.session["id"], {
+        "name": "地点", "keywords": "蜀山", "content": "仙山", "enabled": 1, "sort_order": 1,
+    })
+    # 平铺历史：越窗的"蜀山" + 两条更新消息 → 窗口只取最近 2 条
+    db.append_message(env.session["id"], "user", "很久以前去过蜀山")
+    db.append_message(env.session["id"], "assistant", "嗯")
+    db.append_message(env.session["id"], "user", "最近在聊别的")
+    monkeypatch.setattr(provider_mod, "stream_chat", make_fake_stream(["好"]))
+    resp = TestClient(env.app).post(f"/api/sessions/{env.session['id']}/chat",
+                                    json={"content": "继续"})
+    assert _events(resp)[0]["matched_entries"] == []
+
+
+def test_chat_scan_window_includes_recent_messages(env, monkeypatch) -> None:
+    """窗口内的历史关键词仍参与匹配（scan_rounds=1 → 最近 2 条）。"""
+    db.update_session(env.session["id"], {"scan_rounds": 1})
+    db.create_worldbook_entry(env.session["id"], {
+        "name": "地点", "keywords": "蜀山", "content": "仙山", "enabled": 1, "sort_order": 1,
+    })
+    db.append_message(env.session["id"], "user", "我们去了蜀山")
+    db.append_message(env.session["id"], "assistant", "那里如何？")
+    monkeypatch.setattr(provider_mod, "stream_chat", make_fake_stream(["好"]))
+    resp = TestClient(env.app).post(f"/api/sessions/{env.session['id']}/chat",
+                                    json={"content": "继续"})
+    assert _events(resp)[0]["matched_entries"] == [
+        {"name": "地点", "hit_keywords": ["蜀山"]}]
+
+
+def test_chat_max_context_chars_zero_keeps_full_history(env, monkeypatch) -> None:
+    """max_context_chars=0 → 不裁剪（§6.3），全部历史进入上游 messages。"""
+    db.update_session(env.session["id"], {"max_context_chars": 0})
+    for i in range(6):
+        db.append_message(env.session["id"], "user", f"历史{i}" + "啊" * 300)
+    capture: dict = {}
+    monkeypatch.setattr(provider_mod, "stream_chat", make_fake_stream(["ok"], capture=capture))
+    resp = TestClient(env.app).post(f"/api/sessions/{env.session['id']}/chat",
+                                    json={"content": "最新问题"})
+    assert _events(resp)[-1]["type"] == "done"
+    msgs = capture["messages"]
+    assert len(msgs) == 1 + 6 + 1  # system + 全部历史 + 当前输入
+    assert msgs[0]["role"] == "system"
+    assert "历史0" in msgs[1]["content"]  # 最旧一条保留
+    assert msgs[-1] == {"role": "user", "content": "最新问题"}
+
+
 def test_chat_history_trimmed_by_budget(env, monkeypatch) -> None:
     """预算裁剪：长历史下最旧消息被丢弃，且 system/当前输入不受影响。"""
     db.update_session(env.session["id"], {"max_context_chars": 2000})
@@ -375,6 +425,19 @@ def test_chat_missing_model_config_error_event(env, monkeypatch) -> None:
     assert events[-1]["type"] == "error"
     assert events[-1]["code"] == "internal"
     assert "Base URL" in events[-1]["message"]
+
+
+@pytest.mark.parametrize("code", ["rate_limited", "timeout", "upstream_unreachable", "internal"])
+def test_chat_provider_error_code_passthrough(env, monkeypatch, code: str) -> None:
+    """上游各错误分类原样透传到 NDJSON error；无 delta 时序列为 meta→error。"""
+    err = ProviderError(code, f"上游错误-{code}")
+    monkeypatch.setattr(provider_mod, "stream_chat", make_fake_stream([], error=err))
+    resp = TestClient(env.app).post(f"/api/sessions/{env.session['id']}/chat",
+                                    json={"content": "你好"})
+    events = _events(resp)
+    assert [e["type"] for e in events] == ["meta", "error"]  # meta 必发且最先
+    assert events[-1] == {"type": "error", "code": code, "message": f"上游错误-{code}"}
+    assert env.session["id"] not in chat_mod._in_flight  # 出错后生成权释放
 
 
 # ---------------------------------------------------------------------------
@@ -455,6 +518,29 @@ def test_concurrent_generation_409(env, monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 生成权释放：响应创建前失败也不得把会话永久锁死（409）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("endpoint", ["chat", "regenerate"])
+def test_prepare_failure_releases_generation_lock(env, monkeypatch, endpoint: str) -> None:
+    """_prepare 抛异常（如数据库读取失败）→ 500，但生成权必须释放。"""
+    db.append_message(env.session["id"], "user", "问题")
+
+    def boom(session, content):
+        raise RuntimeError("db read failed")
+
+    monkeypatch.setattr(chat_mod, "_prepare", boom)
+    client = TestClient(env.app, raise_server_exceptions=False)
+    if endpoint == "chat":
+        resp = client.post(f"/api/sessions/{env.session['id']}/chat", json={"content": "你好"})
+    else:
+        resp = client.post(f"/api/sessions/{env.session['id']}/regenerate")
+    assert resp.status_code == 500
+    assert env.session["id"] not in chat_mod._in_flight  # 未泄漏生成权
+
+
+# ---------------------------------------------------------------------------
 # 停止语义：客户端断开 → 中止上游、部分文本落库 interrupted=1
 # ---------------------------------------------------------------------------
 
@@ -476,7 +562,7 @@ def test_disconnect_stores_partial_interrupted(env, monkeypatch) -> None:
             return self.calls >= 1
 
     async def run() -> list[str]:
-        gen = chat_mod._stream_events(StubRequest(), session, "你好呀", [],
+        gen = chat_mod._stream_events(StubRequest(), session, [],
                                       [{"role": "user", "content": "你好呀"}])
         return [line async for line in gen]
 
@@ -504,7 +590,7 @@ def test_framework_cancel_stores_partial(env, monkeypatch) -> None:
     db.append_message(session["id"], "user", "x")
 
     async def run() -> None:
-        gen = chat_mod._stream_events(NeverDisconnect(), session, "x", [],
+        gen = chat_mod._stream_events(NeverDisconnect(), session, [],
                                       [{"role": "user", "content": "x"}])
         await gen.__anext__()   # meta
         await gen.__anext__()   # delta "你"
@@ -529,7 +615,7 @@ def test_cancel_before_any_delta_stores_nothing(env, monkeypatch) -> None:
     db.append_message(session["id"], "user", "x")
 
     async def run() -> None:
-        gen = chat_mod._stream_events(NeverDisconnect(), session, "x", [],
+        gen = chat_mod._stream_events(NeverDisconnect(), session, [],
                                       [{"role": "user", "content": "x"}])
         await gen.__anext__()  # meta
         await gen.aclose()

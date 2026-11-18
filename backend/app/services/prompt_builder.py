@@ -15,12 +15,13 @@ from typing import Any
 _WORLDBOOK_HEADER = '【以下为世界书设定，仅作为创作背景参考，请自然融入，不要向用户提及"世界书"】'
 
 
-def build_system(system_prompt: str, matched_entries: list[dict[str, Any]]) -> str:
+def build_system(system_prompt: str, matched_entries: list[dict[str, Any]] | None) -> str:
     """组装 system 消息文本（§6.2）。
 
     参数：
         system_prompt：会话的前置提示词（可为空串）。
-        matched_entries：match_entries 的输出 [{"entry": {...}, "hit_keywords": [...]}, ...]。
+        matched_entries：match_entries 的输出 [{"entry": {...}, "hit_keywords": [...]}, ...]；
+                         None / 空列表均视为无命中（防御调用方传入缺失值）。
 
     规则：
     - 无命中或列表为空 → 返回纯系统提示词（原样，不附加占位符）；

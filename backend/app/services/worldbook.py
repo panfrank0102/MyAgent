@@ -11,7 +11,12 @@
 
 from __future__ import annotations
 
+import string
 from typing import Any
+
+# 仅映射 ASCII 大写 → 小写；str.translate 在 C 层完成替换，
+# 比逐字符条件拼接快（候选文本每轮可达数万字符）。
+_ASCII_LOWER_TABLE = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 
 
 def _fold_ascii(text: str) -> str:
@@ -20,7 +25,7 @@ def _fold_ascii(text: str) -> str:
     契约只要求 ASCII 忽略大小写，因此不做全量 Unicode .lower()，
     避免对个别非 ASCII 字符产生契约外的折叠行为。
     """
-    return "".join(ch.lower() if "A" <= ch <= "Z" else ch for ch in text)
+    return text.translate(_ASCII_LOWER_TABLE)
 
 
 def _keywords_of(entry: dict[str, Any]) -> list[str]:
@@ -39,11 +44,12 @@ def _keywords_of(entry: dict[str, Any]) -> list[str]:
     return [p.strip() for p in parts if p and p.strip()]
 
 
-def match_entries(text: str, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def match_entries(text: str | None, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """在候选文本中匹配世界书条目。
 
     参数：
-        text：候选文本（最近 scan_rounds 轮消息 + 当前用户输入拼接，§6.1 第 3 点）。
+        text：候选文本（最近 scan_rounds 轮消息 + 当前用户输入拼接，§6.1 第 3 点）；
+              None 按空串处理（永不命中，防御调用方传入缺失值）。
         entries：本会话世界书条目列表（db.list_worldbook 返回的 dict 列表）。
 
     返回：

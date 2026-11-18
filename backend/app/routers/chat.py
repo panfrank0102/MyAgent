@@ -37,6 +37,7 @@ from typing import Any, AsyncGenerator
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 # db 为冻结 DAO 契约（§5.1，backend-core 实现）。get_session 打码回显，
 # 聊天链路必须用 get_session_raw 拿真实 api_key（backend-core 已确认提供）。
@@ -111,11 +112,13 @@ def _matched_meta(matched: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def _prepare(session: dict[str, Any], content: str) -> tuple[list[dict[str, Any]], str, list[dict[str, str]]]:
+def _prepare(session: dict[str, Any], content: str) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     """执行 §6.1 第 3~6 点：匹配 → 组装 system → 预算裁剪 → 组装 messages。
 
     前置约定：调用前"当前输入"必须是该会话最后一条 user 消息（chat 已 append，
     regenerate 已删除旧 assistant 回复），因此这里取 history[:-1] 作为纯历史。
+
+    返回 (matched, messages)：matched 供 meta 事件；messages 直接交给上游。
     """
     session_id = session["id"]
     history: list[dict[str, Any]] = db.list_messages(session_id) or []
@@ -141,13 +144,12 @@ def _prepare(session: dict[str, Any], content: str) -> tuple[list[dict[str, Any]
 
     # ---- 第 6 点：上游 messages 数组 ----
     messages = prompt_builder.build_messages(system_text, trimmed, content)
-    return matched, system_text, messages
+    return matched, messages
 
 
 async def _stream_events(
     request: Request,
     session: dict[str, Any],
-    content: str,
     matched: list[dict[str, Any]],
     messages: list[dict[str, str]],
 ) -> AsyncGenerator[str, None]:
@@ -254,11 +256,24 @@ async def _stream_events(
 
 
 def _chat_response(request: Request, session: dict[str, Any], content: str) -> StreamingResponse:
-    """把已校验会话与输入组装成流式响应（chat/regenerate 共用）。"""
-    matched, _system_text, messages = _prepare(session, content)
+    """把已校验会话与输入组装成流式响应（chat/regenerate 共用）。
+
+    生成权（_in_flight）在调用方已占用，正常由 _stream_events 的 finally 释放；
+    这里额外保证两条边界：
+    - 响应创建前就失败（如数据库读取异常）→ 立即释放，避免会话被永久 409 锁死；
+    - 客户端在流生成器尚未启动时断开（框架直接取消响应）→ 背景任务兜底释放。
+    两处释放都是幂等的，与 finally 重复执行无副作用。
+    """
+    session_id = session["id"]
+    try:
+        matched, messages = _prepare(session, content)
+    except Exception:
+        _release_generation(session_id)
+        raise
     return StreamingResponse(
-        _stream_events(request, session, content, matched, messages),
+        _stream_events(request, session, matched, messages),
         media_type=NDJSON_MEDIA_TYPE,
+        background=BackgroundTask(_release_generation, session_id),
     )
 
 

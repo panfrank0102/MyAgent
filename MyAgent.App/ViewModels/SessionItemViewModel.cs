@@ -61,7 +61,7 @@ public partial class SessionItemViewModel : ObservableObject
 
         // 进入内联重命名：把当前名复制到编辑框
         StartRenameCommand = new RelayCommand(() => { EditName = Name; IsRenaming = true; });
-        // Enter / 失焦提交（校验在父级：空白名不生效）
+        // Enter 提交 / Esc 取消（校验在父级：空白名不生效；点开别处不会自动提交，属已知体验缺口）
         CommitRenameCommand = new AsyncRelayCommand(() => _owner.RenameSessionAsync(this));
         CancelRenameCommand = new RelayCommand(() => IsRenaming = false);
         // 生成中禁止删除/清空，避免与后端的生成流程冲突

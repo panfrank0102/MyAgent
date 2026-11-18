@@ -148,6 +148,83 @@ def test_stream_proxy_passed_to_client(monkeypatch) -> None:
     assert isinstance(captured["timeout"], httpx.Timeout)
 
 
+def test_stream_blank_proxy_means_direct(monkeypatch) -> None:
+    """空白代理串应等价于直连（避免被 httpx 当作非法代理地址）。"""
+    from app.services import provider as provider_mod
+
+    captured: dict[str, Any] = {}
+    real_client = httpx.AsyncClient
+
+    class SpyClient(real_client):
+        def __init__(self, *args, **kwargs):
+            captured["proxy"] = kwargs.pop("proxy", None)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(provider_mod.httpx, "AsyncClient", SpyClient)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _sse_response({"choices": [{"delta": {"content": "ok"}}]})
+
+    collect(stream_chat(BASE, "", "m", MESSAGES, 1.0, 1.0, None, "   ",
+                        transport=httpx.MockTransport(handler)))
+    assert captured["proxy"] is None
+
+
+def test_stream_aclose_releases_upstream() -> None:
+    """消费者 aclose()（停止生成）→ 关闭上游流（资源释放，§4.2 停止语义）。"""
+
+    class RecordingStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def __aiter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"A"}}]}\n\n'
+            await asyncio.sleep(30)  # 未 aclose 时会挂住
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    stream = RecordingStream()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              stream=stream)
+
+    async def scenario() -> None:
+        gen = stream_chat(BASE, "k", "m", MESSAGES, 1.0, 1.0, None, None,
+                          transport=httpx.MockTransport(handler))
+        assert await gen.__anext__() == "A"
+        await gen.aclose()
+        assert stream.closed is True
+
+    asyncio.run(scenario())
+
+
+def test_stream_cancellation_not_mapped_to_provider_error() -> None:
+    """取消（CancelledError）必须原样传播，不能被错误映射吞成 internal。
+
+    停止生成依赖取消一路向上传播到 chat 路由，由后者落库 interrupted=1。
+    """
+
+    class CancelStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"A"}}]}\n\n'
+            raise asyncio.CancelledError()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              stream=CancelStream())
+
+    async def scenario() -> None:
+        gen = stream_chat(BASE, "k", "m", MESSAGES, 1.0, 1.0, None, None,
+                          transport=httpx.MockTransport(handler))
+        assert await gen.__anext__() == "A"
+        with pytest.raises(asyncio.CancelledError):
+            await gen.__anext__()
+
+    asyncio.run(scenario())
+
+
 # ---------- 错误分类（§6.1 第 10 点） ----------
 
 
@@ -247,6 +324,44 @@ def test_error_mid_stream_classified() -> None:
         assert exc_info.value.code == CODE_UPSTREAM_UNREACHABLE
 
     asyncio.run(scenario())
+
+
+# ---------- 真实流式响应上的错误映射（响应体未预读的回归） ----------
+
+
+def _streaming_error_handler(status: int, body: bytes):
+    """模拟真实上游：错误响应以流式通道返回（client.stream 不预读响应体）。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, headers={"content-type": "application/json"},
+                              stream=httpx.ByteStream(body))
+
+    return handler
+
+
+def test_error_streaming_401_auth_failed() -> None:
+    """回归：流式错误体未预读时，401 仍必须映射 auth_failed。
+
+    若在 raise_for_status 后直接访问 resp.text 会抛 ResponseNotRead，
+    导致错误码退化为 internal（违反 §6.1 第 10 点）。
+    """
+    handler = _streaming_error_handler(401, b'{"error":{"message":"bad key"}}')
+    _expect_code(handler, CODE_AUTH_FAILED, assert_status=401)
+
+
+def test_error_streaming_429_rate_limited() -> None:
+    handler = _streaming_error_handler(429, b'{"error":{"message":"quota"}}')
+    _expect_code(handler, CODE_RATE_LIMITED, assert_status=429)
+
+
+def test_error_streaming_500_detail_extracted() -> None:
+    """其余状态仍为 internal，且尽量带上上游 error.message 详情。"""
+    handler = _streaming_error_handler(500, b'{"error":{"message":"boom detail"}}')
+    with pytest.raises(ProviderError) as exc_info:
+        collect(stream_chat(BASE, "k", "m", MESSAGES, 1.0, 1.0, None, None,
+                            transport=httpx.MockTransport(handler)))
+    assert exc_info.value.code == CODE_INTERNAL
+    assert exc_info.value.status_code == 500
+    assert "boom detail" in exc_info.value.message
 
 
 # ---------- test-connection（provider 层） ----------

@@ -53,7 +53,11 @@ public partial class MainViewModel : ObservableObject
         _backend = backend;
         _dialogs = dialogs;
         NewSessionCommand = new AsyncRelayCommand(NewSessionAsync);
-        SendOrStopCommand = new AsyncRelayCommand(SendOrStopAsync, () => CanSendOrStop);
+        // 发送/停止刻意用 RelayCommand（同步返回）而非 AsyncRelayCommand：
+        // CommunityToolkit.Mvvm 的 AsyncRelayCommand 默认禁止并发执行，命令执行期间 CanExecute 恒为 false，
+        // 会让“生成中变为‘停止’”的按钮在生成期间被禁用、无法点击停止（离线垫片不模拟该行为，故不易察觉）。
+        // 因此生成流程脱离命令执行（见 SendOrStop），按钮可用性完全由 CanSendOrStop 控制。
+        SendOrStopCommand = new RelayCommand(SendOrStop, () => CanSendOrStop);
         DismissErrorCommand = new RelayCommand(() => ErrorText = "");
         // 消息增删会影响“空状态提示”的显隐
         Messages.CollectionChanged += (_, _) => OnPropertyChanged(nameof(ShowEmptyChatHint));
@@ -76,7 +80,13 @@ public partial class MainViewModel : ObservableObject
     // —— 命令 ——
 
     public AsyncRelayCommand NewSessionCommand { get; }
-    public AsyncRelayCommand SendOrStopCommand { get; }
+
+    /// <summary>
+    /// 发送/停止按钮：生成中显示“停止”，否则“发送”。
+    /// 用 <see cref="RelayCommand"/> 是因为 AsyncRelayCommand 在命令执行期间会禁用自身（见构造函数注释）。
+    /// </summary>
+    public RelayCommand SendOrStopCommand { get; }
+
     public RelayCommand DismissErrorCommand { get; }
 
     partial void OnSelectedSessionChanged(SessionItemViewModel? value)
@@ -203,7 +213,8 @@ public partial class MainViewModel : ObservableObject
         {
             var info = await _backend.CreateSessionAsync("新会话"); // §4.3：默认名“新会话”
             await RefreshSessionsAsync();
-            SelectedSession = _sessionVms[info.Id];
+            // 防御：极端情况下列表里没有新会话（接口返回与列表不一致）也不抛 KeyNotFoundException
+            if (_sessionVms.TryGetValue(info.Id, out var createdVm)) SelectedSession = createdVm;
         }
         catch (Exception ex)
         {
@@ -310,12 +321,12 @@ public partial class MainViewModel : ObservableObject
 
         ErrorText = "";
         session.LastGenFailed = false;
-        await RunGenerationAsync(session, isRegenerate: true);
+        await RunGenerationSafeAsync(session, isRegenerate: true);
     }
 
     // ---------------- 发送 / 停止 / 流式消费（Step 10） ----------------
 
-    private async Task SendOrStopAsync()
+    private void SendOrStop()
     {
         var session = SelectedSession;
         if (session == null) return;
@@ -345,7 +356,26 @@ public partial class MainViewModel : ObservableObject
         }));
         RefreshMessageCommands();
 
-        await RunGenerationAsync(session, isRegenerate: false, userContent: content);
+        // 生成流程不 await：命令立即返回，按钮在生成期间保持可点击（文案=“停止”），见构造函数注释
+        _ = RunGenerationSafeAsync(session, isRegenerate: false, userContent: content);
+    }
+
+    /// <summary>
+    /// 生成入口的异常兜底：RunGenerationAsync 内部已按 §10 处理业务异常，
+    /// 这里再包一层，避免 fire-and-forget 任务在极端路径（如 finally 内的意外异常）
+    /// 变成未观察异常，或让 AsyncRelayCommand 把异常抛回 UI 线程导致崩溃。
+    /// </summary>
+    private async Task RunGenerationSafeAsync(SessionItemViewModel session, bool isRegenerate, string? userContent = null)
+    {
+        try
+        {
+            await RunGenerationAsync(session, isRegenerate, userContent);
+        }
+        catch (Exception ex)
+        {
+            session.IsGenerating = false;
+            ErrorText = "生成异常：" + ex.Message;
+        }
     }
 
     /// <summary>发起一次生成（发送或重新生成），消费流式事件直到 done/error/取消。</summary>
@@ -379,11 +409,14 @@ public partial class MainViewModel : ObservableObject
         }
         catch (OperationCanceledException) when (cts.IsCancellationRequested)
         {
-            // 用户点击“停止”：保留已生成部分并标注；服务端 finally 已把部分文本落库 interrupted=1
+            // 用户点击“停止”：保留已生成部分并标注；服务端 finally 已把部分文本落库 interrupted=1。
+            // 先把 30ms 缓冲里未冲刷的增量写入 Content，避免随后重拉历史失败时丢掉尾部文本。
+            FlushAllPending();
             if (!string.IsNullOrEmpty(live.Content)) live.Interrupted = true;
         }
         catch (Exception ex)
         {
+            FlushAllPending();
             ErrorText = "生成异常（后端不可达/网络错误）：" + ex.Message;
             session.LastGenFailed = true;
             // §10：生成中网络断开 → 保留已收部分并标注

@@ -4,9 +4,11 @@
 
 估算规则（指导 §6.3 冻结）：
     estimate_tokens(text) = 中文字符数 + ceil(ASCII 字符数 / 4) + 其他字符数
-- 中文（CJK 统一表意文字 U+4E00~U+9FFF）：1 字符 ≈ 1 token；
+- 中文（CJK 统一表意文字）：1 字符 ≈ 1 token；
 - ASCII（ord < 128）：4 字符 ≈ 1 token（向上取整）；
 - 其余字符（全角标点、emoji 等）：1 字符 ≈ 1 token。
+注意：中文与"其余字符"都是 1 字符 ≈ 1 token，因此实现上只需区分
+ASCII / 非 ASCII 两类；CJK 无需单独判定。
 
 预算规则：
 - budget_for_history(max_context_chars, system_text, current_input)
@@ -25,30 +27,22 @@ import math
 from typing import Any
 
 
-def _is_cjk(ch: str) -> bool:
-    """判断字符是否为 CJK 统一表意文字（"中文"的近似口径）。"""
-    return "\u4e00" <= ch <= "\u9fff"
-
-
 def estimate_tokens(text: str) -> int:
     """估算文本的 token 占用（保守估算，指导 §6.3）。
 
     中文 1 字符 ≈ 1 token；ASCII 4 字符 ≈ 1 token（向上取整）；
     其余字符 1 字符 ≈ 1 token。空串返回 0。
+
+    实现说明：用 encode("ascii", "ignore") 在 C 层数出 ASCII 字符数
+    （非 ASCII 字符被忽略），比逐字符 ord() 循环快一个量级；本函数每轮
+    会对 system、当前输入与每条历史反复调用，值得这一步优化。
     """
     if not text:
         return 0
-    ascii_count = 0
-    other_count = 0
-    for ch in text:
-        code = ord(ch)
-        if code < 128:
-            ascii_count += 1  # ASCII：4 字符 ≈ 1 token，最后统一 ceil
-        elif _is_cjk(ch):
-            other_count += 1  # 中文：1 字符 ≈ 1 token
-        else:
-            other_count += 1  # 其余（全角标点/emoji 等）：1 字符 ≈ 1 token
-    return other_count + math.ceil(ascii_count / 4)
+    ascii_count = len(text.encode("ascii", "ignore"))
+    # 非 ASCII（中文 + 全角标点 + emoji 等）统一按 1 字符 ≈ 1 token。
+    non_ascii_count = len(text) - ascii_count
+    return non_ascii_count + math.ceil(ascii_count / 4)
 
 
 def budget_for_history(max_context_chars: int, system_text: str, current_input: str) -> int | None:
@@ -68,11 +62,6 @@ def budget_for_history(max_context_chars: int, system_text: str, current_input: 
     return max_chars - estimate_tokens(system_text) - estimate_tokens(current_input) - 500
 
 
-def _history_estimate(history: list[dict[str, Any]]) -> int:
-    """估算历史消息列表的总 token 数（只统计 content，契约未要求计入 role 等开销）。"""
-    return sum(estimate_tokens(m.get("content") or "") for m in history)
-
-
 def trim_history(history: list[dict[str, Any]], budget: int | None) -> list[dict[str, Any]]:
     """按预算裁剪历史消息：超限时从最旧整条消息开始丢弃。
 
@@ -88,6 +77,9 @@ def trim_history(history: list[dict[str, Any]], budget: int | None) -> list[dict
       若只剩最后一条仍超预算，保底保留最后一条（与 0 预算规则一致，
       避免把最近的上下文也裁掉）。
 
+    实现：每条消息只估算一次，用"总估算 − 被丢弃消息的估算"单遍推进；
+    避免每丢一条就重算全部剩余历史（大历史下的 O(n²) 字符扫描）。
+
     注意：返回新列表，不修改入参。
     """
     if budget is None:
@@ -100,8 +92,12 @@ def trim_history(history: list[dict[str, Any]], budget: int | None) -> list[dict
         # 契约：0/负数预算时只保留最后一条；仍超也保留最后一条。
         return history[-1:]
 
-    kept = list(history)
+    estimates = [estimate_tokens(m.get("content") or "") for m in history]
+    total = sum(estimates)
     # 从最旧整条消息丢弃；至少保留最后一条（边界：单条消息本身超预算时不丢）。
-    while len(kept) > 1 and _history_estimate(kept) > budget:
-        kept.pop(0)
-    return kept
+    start = 0
+    last_index = len(history) - 1
+    while start < last_index and total > budget:
+        total -= estimates[start]
+        start += 1
+    return list(history[start:])

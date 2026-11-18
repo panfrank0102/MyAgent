@@ -1,4 +1,5 @@
 using System.Collections.Specialized;
+using System.ComponentModel;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -22,6 +23,9 @@ public partial class MainWindow : Window
     /// <summary>是否贴底跟随：用户上滚查看历史时暂停自动滚底，滚回底部后恢复。</summary>
     private bool _stickToBottom = true;
 
+    /// <summary>是否已排队一次滚底：同一帧内多次集合变化只滚一次（见 OnMessagesCollectionChanged）。</summary>
+    private bool _scrollRequestPending;
+
     public MainWindow()
     {
         InitializeComponent();
@@ -33,6 +37,16 @@ public partial class MainWindow : Window
         // 消息集合变化（增删/清空/重建）后滚动到底部。
         // Messages 实例不会整体替换（见 MainViewModel 注释），订阅一次即可。
         _viewModel.Messages.CollectionChanged += OnMessagesCollectionChanged;
+
+        // 切换会话时重置贴底状态（否则在上一个会话里上滚查看历史后，
+        // 切到新会话仍处于“暂停跟随”，新会话不会自动滚到底部）
+        _viewModel.PropertyChanged += OnViewModelPropertyChanged;
+    }
+
+    private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName == nameof(MainViewModel.SelectedSession))
+            _stickToBottom = true;
     }
 
     private async void Window_Loaded(object sender, RoutedEventArgs e)
@@ -42,8 +56,16 @@ public partial class MainWindow : Window
 
     private void OnMessagesCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
     {
-        // 集合变化时新元素尚未完成布局，推迟到布局优先级再滚动
-        Dispatcher.BeginInvoke(ScrollToEndIfSticky, DispatcherPriority.Background);
+        // 集合变化时新元素尚未完成布局，推迟到布局优先级再滚动。
+        // 一次加载/清空会连发“Reset + N 次 Add”（N 最大 200），这里合并为一帧一次滚底，
+        // 避免重复触发 ScrollToEnd 与整表重排。
+        if (_scrollRequestPending) return;
+        _scrollRequestPending = true;
+        Dispatcher.BeginInvoke(new Action(() =>
+        {
+            _scrollRequestPending = false;
+            ScrollToEndIfSticky();
+        }), DispatcherPriority.Background);
     }
 
     private void ScrollToEndIfSticky()
